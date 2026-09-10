@@ -6,7 +6,7 @@ description = "RustDownViewer — native cross-platform Markdown viewer & editor
 license = "MIT"
 
 [[bin]]
-name = "rustdown"
+name = "rapidmd"
 path = "src/main.rs"
 
 [dependencies]

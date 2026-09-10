@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui::{
-self, Align, Align2, FontId, Key, Layout, Margin, RichText, ScrollArea, TextEdit, Vec2,
+self, Align, Align2, Color32, FontId, Key, Layout, Margin, Pos2, Rect, RichText, ScrollArea, Sense, TextEdit, Vec2,
 };
 
 use crate::buffer::{Buffer, Encoding};
@@ -64,8 +64,16 @@ enum Cmd {
     ZoomReset,
     Wrap,
     Numbers,
+    SyncScroll,
+    ToggleFps,
     GoToLine,
     About,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitScrollDriver {
+    Editor,
+    Preview,
 }
 
 #[derive(Clone, Copy)]
@@ -102,6 +110,108 @@ pub struct App {
     cols: usize,
     last_edit: Instant,
     focus_editor: bool,
+    split_scroll_ratio: f32,
+    split_scroll_driver: SplitScrollDriver,
+    preview_max_scroll: f32,
+    editor_max_scroll: f32,
+    last_frame_time: Instant,
+    fps: f32,
+    icon_texture: Option<egui::TextureHandle>,
+}
+
+fn menu_separator(ui: &mut egui::Ui, pal: &Palette) {
+    ui.add_space(3.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().hline(rect.x_range(), rect.center().y, egui::Stroke::new(1.0, pal.hr));
+    ui.add_space(3.0);
+}
+
+fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, checked: Option<bool>, pal: &Palette) -> egui::Response {
+    let desired_h = 24.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(170.0), desired_h), Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 5.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    let text_color = if response.hovered() {
+        if pal.dark { Color32::WHITE } else { Color32::BLACK }
+    } else {
+        pal.text
+    };
+    let mut left_x = rect.left() + 8.0;
+    if let Some(is_checked) = checked {
+        if is_checked {
+            ui.painter().text(
+                Pos2::new(left_x, rect.center().y),
+                Align2::LEFT_CENTER,
+                "✓",
+                FontId::proportional(12.0),
+                if pal.dark { Color32::WHITE } else { Color32::BLACK },
+            );
+        }
+        left_x += 16.0;
+    }
+    ui.painter().text(
+        Pos2::new(left_x, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.5),
+        text_color,
+    );
+    if !shortcut.is_empty() {
+        let faint_color = pal.faint;
+        ui.painter().text(
+            Pos2::new(rect.right() - 8.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            shortcut,
+            FontId::proportional(11.0),
+            faint_color,
+        );
+    }
+    response
+}
+
+fn menu_toggle(ui: &mut egui::Ui, label: &str, is_on: bool, pal: &Palette) -> egui::Response {
+    let desired_h = 26.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(170.0), desired_h), Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 5.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    let text_color = if response.hovered() {
+        if pal.dark { Color32::WHITE } else { Color32::BLACK }
+    } else {
+        pal.text
+    };
+    ui.painter().text(
+        Pos2::new(rect.left() + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.5),
+        text_color,
+    );
+    let toggle_w = 26.0;
+    let toggle_h = 14.0;
+    let toggle_rect = Rect::from_center_size(
+        Pos2::new(rect.right() - toggle_w * 0.5 - 8.0, rect.center().y),
+        Vec2::new(toggle_w, toggle_h),
+    );
+    let (track_fill, track_stroke, thumb_fill, thumb_x) = if is_on {
+        let (tf, thf) = if pal.dark {
+            (Color32::WHITE, Color32::from_rgb(18, 19, 23))
+        } else {
+            (Color32::from_rgb(17, 17, 19), Color32::WHITE)
+        };
+        (tf, egui::Stroke::NONE, thf, toggle_rect.right() - 7.0)
+    } else {
+        let (tf, strk, thf) = if pal.dark {
+            (Color32::from_rgb(30, 32, 38), egui::Stroke::new(1.0, pal.hr), Color32::from_rgb(110, 112, 120))
+        } else {
+            (Color32::from_rgb(230, 232, 236), egui::Stroke::new(1.0, pal.hr), Color32::from_rgb(160, 162, 170))
+        };
+        (tf, strk, thf, toggle_rect.left() + 7.0)
+    };
+    ui.painter().rect(toggle_rect, 7.0, track_fill, track_stroke, egui::StrokeKind::Inside);
+    ui.painter().circle_filled(Pos2::new(thumb_x, toggle_rect.center().y), 4.5, thumb_fill);
+    response
 }
 
 impl App {
@@ -137,6 +247,13 @@ impl App {
             cols: 4,
             last_edit: Instant::now(),
             focus_editor: false,
+            split_scroll_ratio: 0.0,
+            split_scroll_driver: SplitScrollDriver::Editor,
+            preview_max_scroll: 0.0,
+            editor_max_scroll: 0.0,
+            last_frame_time: Instant::now(),
+            fps: 60.0,
+            icon_texture: None,
         };
         for arg in std::env::args().skip(1) {
             let p = PathBuf::from(&arg);
@@ -149,6 +266,26 @@ impl App {
             app.modal = Some(Modal::Recovery { items });
         }
         app
+    }
+
+    fn app_icon(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        if let Some(ref t) = self.icon_texture {
+            return Some(t.clone());
+        }
+        let bytes = include_bytes!("../assets/Icon/RMD.png");
+        if let Ok(img) = image::load_from_memory(bytes) {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                [w as usize, h as usize],
+                &rgba.into_raw(),
+            );
+            let tex = ctx.load_texture("rmd_icon", color_img, egui::TextureOptions::LINEAR);
+            self.icon_texture = Some(tex.clone());
+            Some(tex)
+        } else {
+            None
+        }
     }
 
     // ---------------------------------------------------------------- core
@@ -477,6 +614,8 @@ impl App {
             push(self, Cmd::ZoomReset);
         } else if cmd && kp(ctx, Key::G) {
             push(self, Cmd::GoToLine);
+        } else if kp(ctx, Key::F1) {
+            push(self, Cmd::About);
         }
     }
 
@@ -599,6 +738,14 @@ impl App {
                 self.settings.show_line_numbers = !self.settings.show_line_numbers;
                 self.settings.save();
             }
+            Cmd::SyncScroll => {
+                self.settings.sync_scroll = !self.settings.sync_scroll;
+                self.settings.save();
+            }
+            Cmd::ToggleFps => {
+                self.settings.show_fps = !self.settings.show_fps;
+                self.settings.save();
+            }
             Cmd::GoToLine => {
                 self.goto = String::new();
                 self.modal = Some(Modal::GoTo { idx: self.active.unwrap_or(0) });
@@ -618,6 +765,17 @@ impl App {
     fn update_impl(&mut self, ctx: &egui::Context) {
         self.ctx_handle = Some(ctx.clone());
         self.handle_keys(ctx);
+
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame_time).as_secs_f32();
+        self.last_frame_time = now;
+        if dt > 0.0001 && dt < 1.0 {
+            let current_fps = 1.0 / dt;
+            self.fps = self.fps * 0.85 + current_fps * 0.15;
+        }
+        if self.settings.show_fps {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
 
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.dirty_list().is_empty() {
@@ -657,27 +815,36 @@ impl App {
 
         let modal = self.modal.take();
 
-        egui::TopBottomPanel::top("menu").exact_height(26.0).show(ctx, |ui| {
+        let panel_frame = egui::Frame::new().fill(self.palette.panel_bg).stroke(egui::Stroke::new(1.0, self.palette.hr));
+        egui::TopBottomPanel::top("menu").frame(panel_frame).exact_height(26.0).show(ctx, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| self.menu_row(ui));
         });
-        egui::TopBottomPanel::top("tool").exact_height(32.0).show(ctx, |ui| {
+        egui::TopBottomPanel::top("tool").frame(panel_frame).exact_height(32.0).show(ctx, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| self.tool_row(ui));
         });
         if self.buffers.len() > 1 {
-            egui::TopBottomPanel::top("tabs").exact_height(24.0).show(ctx, |ui| {
+            egui::TopBottomPanel::top("tabs").frame(panel_frame).exact_height(24.0).show(ctx, |ui| {
                 ui.add_enabled_ui(modal.is_none(), |ui| self.tab_row(ui));
             });
         }
         if self.find.open && self.active.is_some() {
-            egui::TopBottomPanel::top("find").exact_height(28.0).show(ctx, |ui| {
+            egui::TopBottomPanel::top("find").frame(panel_frame).exact_height(28.0).show(ctx, |ui| {
                 ui.add_enabled_ui(modal.is_none(), |ui| self.find_row(ui));
             });
         }
-        egui::TopBottomPanel::bottom("status").exact_height(22.0).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("status").frame(panel_frame).exact_height(22.0).show(ctx, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| self.status_row(ui));
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let central_frame = egui::Frame::new()
+            .fill(self.palette.window_bg)
+            .inner_margin(egui::Margin {
+                left: 4,
+                right: 4,
+                top: 8,
+                bottom: 4,
+            });
+        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| {
                 if let Some(i) = self.active {
                     match self.mode {
@@ -689,6 +856,7 @@ impl App {
                                 .min_width(120.0)
                                 .max_width((ui.available_width() - 120.0).max(120.0))
                                 .default_width(ui.available_width() * 0.5)
+                                .frame(egui::Frame::new().fill(self.palette.window_bg).stroke(egui::Stroke::new(1.0, self.palette.hr)))
                                 .show_inside(ui, |ui| self.edit_pane(ui, i));
                             self.view_pane(ui, i);
                         }
@@ -738,113 +906,155 @@ impl App {
     // ------------------------------------------------------------ UI pieces
 
     fn menu_row(&mut self, ui: &mut egui::Ui) {
-        egui::menu::bar(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("New").clicked() {
-                    self.pending.push(Cmd::New);
-                    ui.close_menu();
-                }
-                if ui.button("Open…").clicked() {
-                    self.pending.push(Cmd::Open);
-                    ui.close_menu();
-                }
-                ui.separator();
-                let recents = self.settings.recent_paths();
-                if !recents.is_empty() {
-                    ui.menu_button("Open Recent", |ui| {
-                        for r in recents {
-                            if ui.button(r.display().to_string()).clicked() {
-                                self.pending.push(Cmd::OpenRecent(r));
+        let pal = self.palette.clone();
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+            ui.spacing_mut().button_padding = egui::vec2(9.0, 4.0);
+
+            let visuals = ui.visuals_mut();
+            visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
+            visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+            visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+            visuals.widgets.hovered.bg_fill = if pal.dark {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+            } else {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 16)
+            };
+            visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+            visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+            visuals.widgets.active.bg_fill = if pal.dark {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 36)
+            } else {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 24)
+            };
+            visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+            visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+            visuals.widgets.open.bg_fill = visuals.widgets.active.bg_fill;
+            visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+            visuals.widgets.open.corner_radius = egui::CornerRadius::same(6);
+
+            visuals.menu_corner_radius = egui::CornerRadius::same(8);
+            visuals.window_corner_radius = egui::CornerRadius::same(8);
+            visuals.window_fill = if pal.dark { Color32::from_rgb(18, 19, 23) } else { Color32::WHITE };
+            visuals.window_stroke = egui::Stroke::new(1.0, pal.hr);
+            visuals.selection.stroke = egui::Stroke::NONE;
+            visuals.selection.bg_fill = visuals.widgets.hovered.bg_fill;
+
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button(RichText::new("File").size(13.0).color(pal.text), |ui| {
+                    ui.set_min_width(200.0);
+                    if menu_item(ui, "New Document", "Ctrl+N", None, &pal).clicked() {
+                        self.pending.push(Cmd::New);
+                        ui.close_menu();
+                    }
+                    if menu_item(ui, "Open…", "Ctrl+O", None, &pal).clicked() {
+                        self.pending.push(Cmd::Open);
+                        ui.close_menu();
+                    }
+                    menu_separator(ui, &pal);
+                    let recents = self.settings.recent_paths();
+                    if !recents.is_empty() {
+                        ui.menu_button("Open Recent", |ui| {
+                            ui.set_min_width(220.0);
+                            for r in recents {
+                                let name = r.file_name().and_then(|n| n.to_str()).unwrap_or("document");
+                                if menu_item(ui, name, "", None, &pal).on_hover_text(r.display().to_string()).clicked() {
+                                    self.pending.push(Cmd::OpenRecent(r));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        menu_separator(ui, &pal);
+                    }
+                    if menu_item(ui, "Save", "Ctrl+S", None, &pal).clicked() {
+                        self.pending.push(Cmd::Save);
+                        ui.close_menu();
+                    }
+                    if menu_item(ui, "Save As…", "Ctrl+Shift+S", None, &pal).clicked() {
+                        self.pending.push(Cmd::SaveAs);
+                        ui.close_menu();
+                    }
+                    menu_separator(ui, &pal);
+                    if menu_item(ui, "Close Tab", "Ctrl+W", None, &pal).clicked() {
+                        self.pending.push(Cmd::CloseTab);
+                        ui.close_menu();
+                    }
+                    if menu_item(ui, "Quit", "Ctrl+Shift+W", None, &pal).clicked() {
+                        self.pending.push(Cmd::Quit);
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button(RichText::new("Edit").size(13.0).color(pal.text), |ui| {
+                    ui.set_min_width(180.0);
+                    if menu_item(ui, "Find / Replace", "Ctrl+F", None, &pal).clicked() {
+                        self.pending.push(Cmd::FindBar);
+                        ui.close_menu();
+                    }
+                    if menu_item(ui, "Go to Line…", "Ctrl+G", None, &pal).clicked() {
+                        self.pending.push(Cmd::GoToLine);
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button(RichText::new("View").size(13.0).color(pal.text), |ui| {
+                    ui.set_min_width(220.0);
+                    if menu_item(ui, "View", "Ctrl+1", Some(self.mode == Mode::View), &pal).clicked() {
+                        self.pending.push(Cmd::Mode(Mode::View));
+                        ui.close_menu();
+                    }
+                    if menu_item(ui, "Edit", "Ctrl+2", Some(self.mode == Mode::Edit), &pal).clicked() {
+                        self.pending.push(Cmd::Mode(Mode::Edit));
+                        ui.close_menu();
+                    }
+                    if menu_item(ui, "Split", "Ctrl+3", Some(self.mode == Mode::Split), &pal).clicked() {
+                        self.pending.push(Cmd::Mode(Mode::Split));
+                        ui.close_menu();
+                    }
+                    menu_separator(ui, &pal);
+                    ui.menu_button("Theme", |ui| {
+                        ui.set_min_width(140.0);
+                        for t in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::System] {
+                            if menu_item(ui, t.label(), "", Some(self.settings.theme == t), &pal).clicked() {
+                                self.pending.push(Cmd::Theme(t));
                                 ui.close_menu();
                             }
                         }
                     });
-                }
-                ui.separator();
-                if ui.button("Save").clicked() {
-                    self.pending.push(Cmd::Save);
-                    ui.close_menu();
-                }
-                if ui.button("Save As…").clicked() {
-                    self.pending.push(Cmd::SaveAs);
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("Close Tab").clicked() {
-                    self.pending.push(Cmd::CloseTab);
-                    ui.close_menu();
-                }
-                if ui.button("Quit").clicked() {
-                    self.pending.push(Cmd::Quit);
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("Edit", |ui| {
-                if ui.button("Find / Replace").clicked() {
-                    self.pending.push(Cmd::FindBar);
-                    ui.close_menu();
-                }
-                if ui.button("Go to Line…").clicked() {
-                    self.pending.push(Cmd::GoToLine);
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("View", |ui| {
-                if ui.selectable_label(self.mode == Mode::View, "View  Ctrl+1").clicked() {
-                    self.pending.push(Cmd::Mode(Mode::View));
-                    ui.close_menu();
-                }
-                if ui.selectable_label(self.mode == Mode::Edit, "Edit  Ctrl+2").clicked() {
-                    self.pending.push(Cmd::Mode(Mode::Edit));
-                    ui.close_menu();
-                }
-                if ui.selectable_label(self.mode == Mode::Split, "Split  Ctrl+3").clicked() {
-                    self.pending.push(Cmd::Mode(Mode::Split));
-                    ui.close_menu();
-                }
-                ui.separator();
-                ui.menu_button("Theme", |ui| {
-                    for t in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::System] {
-                        if ui.selectable_label(self.settings.theme == t, t.label()).clicked() {
-                            self.pending.push(Cmd::Theme(t));
-                            ui.close_menu();
-                        }
+                    menu_separator(ui, &pal);
+                    if menu_toggle(ui, "Wrap editor text", self.settings.wrap_editor, &pal).clicked() {
+                        self.pending.push(Cmd::Wrap);
+                        ui.close_menu();
+                    }
+                    if menu_toggle(ui, "Line numbers", self.settings.show_line_numbers, &pal).clicked() {
+                        self.pending.push(Cmd::Numbers);
+                        ui.close_menu();
+                    }
+                    if menu_toggle(ui, "Sync scroll in split view", self.settings.sync_scroll, &pal).clicked() {
+                        self.pending.push(Cmd::SyncScroll);
+                        ui.close_menu();
+                    }
+                    if menu_toggle(ui, "Show FPS counter", self.settings.show_fps, &pal).clicked() {
+                        self.pending.push(Cmd::ToggleFps);
+                        ui.close_menu();
+                    }
+                    menu_separator(ui, &pal);
+                    if menu_item(ui, "Zoom In", "Ctrl+=", None, &pal).clicked() {
+                        self.pending.push(Cmd::ZoomIn);
+                        ui.close_menu();
+                    }
+                    if menu_item(ui, "Zoom Out", "Ctrl+-", None, &pal).clicked() {
+                        self.pending.push(Cmd::ZoomOut);
+                        ui.close_menu();
+                    }
+                    if menu_item(ui, "Reset zoom", "Ctrl+0", None, &pal).clicked() {
+                        self.pending.push(Cmd::ZoomReset);
+                        ui.close_menu();
                     }
                 });
-                ui.separator();
-                if ui.selectable_label(self.settings.wrap_editor, "Wrap editor text").clicked() {
-                    self.pending.push(Cmd::Wrap);
-                    ui.close_menu();
-                }
-                if ui.selectable_label(self.settings.show_line_numbers, "Line numbers").clicked() {
-                    self.pending.push(Cmd::Numbers);
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("Zoom In").clicked() {
-                    self.pending.push(Cmd::ZoomIn);
-                    ui.close_menu();
-                }
-                if ui.button("Zoom Out").clicked() {
-                    self.pending.push(Cmd::ZoomOut);
-                    ui.close_menu();
-                }
-                if ui.button("Reset zoom").clicked() {
-                    self.pending.push(Cmd::ZoomReset);
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("Help", |ui| {
-                if ui.button("About RustDownViewer").clicked() {
+
+                if ui.button(RichText::new("Help").size(13.0).color(pal.text)).clicked() {
                     self.pending.push(Cmd::About);
-                    ui.close_menu();
-                }
-                if ui.button("Open FEATURES_AND_SCENARIOS.md").clicked() {
-                    let p = std::env::current_dir().unwrap_or_default().join("docs").join("FEATURES_AND_SCENARIOS.md");
-                    if p.exists() {
-                        self.pending.push(Cmd::Open);
-                        let _ = p;
-                    }
                 }
             });
         });
@@ -852,10 +1062,44 @@ impl App {
 
     fn tool_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.mode, Mode::View, "View");
-            ui.selectable_value(&mut self.mode, Mode::Edit, "Edit");
-            ui.selectable_value(&mut self.mode, Mode::Split, "Split");
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+            // Tesla-style Segmented Capsule Control for Mode
+            egui::Frame::new()
+                .fill(self.palette.widget_bg)
+                .corner_radius(6.0)
+                .stroke(egui::Stroke::new(1.0, self.palette.hr))
+                .inner_margin(egui::Margin::symmetric(2, 1))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(1.0, 0.0);
+                    for (m, lbl) in [(Mode::View, "View"), (Mode::Edit, "Edit"), (Mode::Split, "Split")] {
+                        let active = self.mode == m;
+                        let (bg, fg) = if active {
+                            if self.palette.dark {
+                                (Color32::from_rgb(40, 42, 50), Color32::WHITE)
+                            } else {
+                                (Color32::WHITE, Color32::BLACK)
+                            }
+                        } else {
+                            (Color32::TRANSPARENT, self.palette.faint)
+                        };
+                        let stroke = if active {
+                            egui::Stroke::new(1.0, self.palette.hr)
+                        } else {
+                            egui::Stroke::NONE
+                        };
+                        let btn = egui::Button::new(RichText::new(lbl).color(fg).size(12.0).strong())
+                            .fill(bg)
+                            .stroke(stroke)
+                            .corner_radius(5.0)
+                            .min_size(Vec2::new(38.0, 18.0));
+                        if ui.add(btn).clicked() {
+                            self.mode = m;
+                        }
+                    }
+                });
+            ui.add_space(2.0);
             ui.separator();
+            ui.add_space(2.0);
             if ui.button("New").clicked() {
                 self.pending.push(Cmd::New);
             }
@@ -943,20 +1187,42 @@ impl App {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
                     let titles: Vec<(String, bool)> = self.buffers.iter().map(|b| (b.title(), b.is_dirty())).collect();
-                    let count = titles.len();
                     for (i, (name, dirty)) in titles.iter().enumerate() {
-                        let label = if *dirty { format!("● {}", name) } else { name.clone() };
-                        if ui.selectable_label(self.active == Some(i), label).clicked() {
-                            self.active = Some(i);
-                            self.invalidate_preview();
-                        }
-                        if ui.small_button("×").clicked() {
-                            self.close_tab(i);
-                        }
-                        if i + 1 < count {
-                            ui.separator();
-                        }
+                        let is_active = self.active == Some(i);
+                        let bg = if is_active {
+                            self.palette.widget_bg
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let border = if is_active {
+                            egui::Stroke::new(1.0, self.palette.hr)
+                        } else {
+                            egui::Stroke::NONE
+                        };
+                        egui::Frame::new()
+                            .fill(bg)
+                            .stroke(border)
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::symmetric(8, 2))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(5.0, 0.0);
+                                    if *dirty {
+                                        let dot_color = if self.palette.dark { Color32::from_rgb(220, 160, 80) } else { Color32::from_rgb(180, 100, 20) };
+                                        ui.label(RichText::new("●").size(8.0).color(dot_color));
+                                    }
+                                    let text_color = if is_active { self.palette.text } else { self.palette.faint };
+                                    if ui.add(egui::Label::new(RichText::new(name).color(text_color).strong().size(12.0)).sense(Sense::click())).clicked() {
+                                        self.active = Some(i);
+                                        self.invalidate_preview();
+                                    }
+                                    if ui.add(egui::Button::new(RichText::new("×").size(11.0).color(self.palette.faint)).frame(false)).clicked() {
+                                        self.close_tab(i);
+                                    }
+                                });
+                            });
                     }
                 });
             });
@@ -964,8 +1230,9 @@ impl App {
 
     fn find_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Find").color(self.palette.faint));
-            let changed = ui.add(TextEdit::singleline(&mut self.find.query).desired_width(200.0).hint_text("search…")).changed();
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+            ui.label(RichText::new("Find").color(self.palette.faint).size(12.0));
+            let changed = ui.add(TextEdit::singleline(&mut self.find.query).desired_width(180.0).hint_text("Search…").margin(Margin::symmetric(6, 2))).changed();
             ui.checkbox(&mut self.find.case_sensitive, "Aa");
             if ui.button("↑").clicked() {
                 self.pending.push(Cmd::FindPrev);
@@ -974,15 +1241,15 @@ impl App {
                 self.pending.push(Cmd::FindNext);
             }
             ui.separator();
-            ui.label(RichText::new("Replace").color(self.palette.faint));
-            ui.add(TextEdit::singleline(&mut self.find.replace).desired_width(140.0));
+            ui.label(RichText::new("Replace").color(self.palette.faint).size(12.0));
+            ui.add(TextEdit::singleline(&mut self.find.replace).desired_width(140.0).margin(Margin::symmetric(6, 2)));
             if ui.button("Replace").clicked() {
                 self.pending.push(Cmd::Replace);
             }
             if ui.button("All").clicked() {
                 self.pending.push(Cmd::ReplaceAll);
             }
-            if ui.button("✕").clicked() {
+            if ui.add(egui::Button::new(RichText::new("✕").size(12.0).color(self.palette.faint)).frame(false)).clicked() {
                 self.find.open = false;
                 self.find_matches.clear();
             }
@@ -994,18 +1261,24 @@ impl App {
 
     fn status_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
             if let Some(b) = self.current() {
-                let state = if b.missing_on_disk {
-                    "missing"
+                let (state, color) = if b.missing_on_disk {
+                    ("MISSING", self.palette.danger)
                 } else if b.read_only {
-                    "read-only"
+                    ("READ-ONLY", self.palette.faint)
                 } else if b.is_dirty() {
-                    "modified"
+                    ("MODIFIED", self.palette.warning)
                 } else {
-                    "saved"
+                    ("SAVED", self.palette.faint)
                 };
-                let color = if b.is_dirty() { self.palette.warning } else { self.palette.success };
-                ui.label(RichText::new(state).color(color).strong());
+                egui::Frame::new()
+                    .fill(self.palette.widget_bg)
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::symmetric(6, 2))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(state).color(color).size(10.0).strong());
+                    });
 ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                 if b.encoding != Encoding::Utf8 {
                     ui.label(RichText::new(b.encoding.label()).color(self.palette.faint).monospace().size(11.0));
@@ -1020,9 +1293,24 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                 ui.label(RichText::new(format!("Ln {}, Col {}", ln, col)).monospace().color(self.palette.faint).size(11.0));
                 ui.label(RichText::new(format!("Words: {}", b.word_count())).color(self.palette.faint).size(11.0));
             } else {
-                ui.label(RichText::new("No document open").color(self.palette.faint));
+                ui.label(RichText::new("No document open").color(self.palette.faint).size(11.0));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.settings.show_fps {
+                    let fps_val = self.fps.round().max(1.0) as u32;
+                    let fps_badge = egui::Frame::new()
+                        .fill(self.palette.widget_bg)
+                        .stroke(egui::Stroke::new(1.0, self.palette.hr))
+                        .corner_radius(4.0)
+                        .inner_margin(egui::Margin::symmetric(5, 1))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(format!("{} FPS", fps_val)).monospace().color(self.palette.faint).size(10.0));
+                        });
+                    if fps_badge.response.on_hover_text("Frame rate (click to hide)").interact(Sense::click()).clicked() {
+                        self.pending.push(Cmd::ToggleFps);
+                    }
+                    ui.add_space(4.0);
+                }
                 ui.label(RichText::new(format!("{}%", (self.settings.zoom * 100.0).round() as i32)).monospace().color(self.palette.faint).size(11.0));
                 ui.label(RichText::new(match self.mode {
                     Mode::View => "View",
@@ -1034,31 +1322,128 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
     }
 
     fn welcome(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.2);
-            ui.label(RichText::new("RustDownViewer").strong().size(38.0).color(self.palette.accent));
-            ui.label(RichText::new("Native Markdown viewer & editor").color(self.palette.faint).size(16.0));
-            ui.add_space(26.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 14.0;
-                if ui.add(egui::Button::new(RichText::new("Open File…").size(16.0)).min_size(Vec2::new(140.0, 42.0))).clicked() {
-                    self.pending.push(Cmd::Open);
-                }
-                if ui.add(egui::Button::new(RichText::new("New File").size(16.0)).min_size(Vec2::new(140.0, 42.0))).clicked() {
-                    self.pending.push(Cmd::New);
-                }
+        let avail_w = ui.available_width();
+        let avail_h = ui.available_height();
+        let content_w = 520.0f32.min(avail_w - 48.0).max(280.0);
+        let side_margin = ((avail_w - content_w) * 0.5).max(16.0);
+        let card_bg = if self.palette.dark { Color32::from_rgb(20, 21, 26) } else { Color32::WHITE };
+
+        ScrollArea::vertical()
+            .id_salt("welcome_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space((avail_h * 0.12).clamp(24.0, 90.0));
+                ui.horizontal(|ui| {
+                    ui.add_space(side_margin);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(content_w);
+                        ui.set_width(content_w);
+
+                        ui.vertical_centered(|ui| {
+                            if let Some(tex) = self.app_icon(ui.ctx()) {
+                                let img = egui::Image::new(&tex)
+                                    .fit_to_exact_size(Vec2::new(76.0, 76.0))
+                                    .corner_radius(14.0);
+                                ui.add(img);
+                            }
+                            ui.add_space(16.0);
+                            ui.label(RichText::new("RapidMD").strong().size(36.0).color(self.palette.accent));
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Native Markdown viewer & editor").color(self.palette.faint).size(14.0));
+                            ui.add_space(26.0);
+
+                            // Centered action buttons
+                            let btn_w = ((content_w - 14.0) * 0.5).clamp(130.0, 180.0);
+                            let total_buttons_w = btn_w * 2.0 + 14.0;
+                            let btn_side_margin = ((content_w - total_buttons_w) * 0.5).max(0.0);
+
+                            ui.horizontal(|ui| {
+                                ui.add_space(btn_side_margin);
+                                let (primary_fill, primary_fg) = if self.palette.dark {
+                                    (Color32::WHITE, Color32::BLACK)
+                                } else {
+                                    (Color32::from_rgb(17, 17, 19), Color32::WHITE)
+                                };
+                                let open_btn = egui::Button::new(
+                                    RichText::new("📂  Open File…").size(14.0).color(primary_fg).strong()
+                                )
+                                .fill(primary_fill)
+                                .corner_radius(8.0)
+                                .min_size(Vec2::new(btn_w, 40.0));
+                                if ui.add(open_btn).clicked() {
+                                    self.pending.push(Cmd::Open);
+                                }
+
+                                let new_btn = egui::Button::new(
+                                    RichText::new("➕  New Document").size(14.0).color(self.palette.text).strong()
+                                )
+                                .fill(self.palette.widget_bg)
+                                .stroke(egui::Stroke::new(1.0, self.palette.hr))
+                                .corner_radius(8.0)
+                                .min_size(Vec2::new(btn_w, 40.0));
+                                if ui.add(new_btn).clicked() {
+                                    self.pending.push(Cmd::New);
+                                }
+                            });
+
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("Ctrl+O to open · Ctrl+N for new").color(self.palette.faint).size(11.0));
+                        });
+
+                        ui.add_space(32.0);
+
+                        // Recent documents card
+                        let recents = self.settings.recent_paths();
+                        if !recents.is_empty() {
+                            egui::Frame::new()
+                                .fill(card_bg)
+                                .stroke(egui::Stroke::new(1.0, self.palette.hr))
+                                .corner_radius(10.0)
+                                .inner_margin(egui::Margin::symmetric(18, 14))
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new("Recent Documents").color(self.palette.text).size(13.0).strong());
+                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                ui.label(RichText::new(format!("{} items", recents.len().min(6))).color(self.palette.faint).size(11.0));
+                                            });
+                                        });
+                                        ui.add_space(8.0);
+                                        ui.separator();
+                                        ui.add_space(6.0);
+
+                                        for r in recents.iter().take(6) {
+                                            let file_name = r.file_name().and_then(|n| n.to_str()).unwrap_or("document");
+                                            let parent_dir = r.parent().map(|p| p.display().to_string()).unwrap_or_default();
+                                            let path_tooltip = r.display().to_string();
+
+                                            let row_resp = ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                                                ui.label(RichText::new("📄").size(14.0));
+                                                ui.vertical(|ui| {
+                                                    ui.label(RichText::new(file_name).color(self.palette.text).size(13.0).strong());
+                                                    if !parent_dir.is_empty() {
+                                                        ui.label(RichText::new(&parent_dir).color(self.palette.faint).size(10.0));
+                                                    }
+                                                });
+                                            });
+                                            let interact_resp = ui.interact(row_resp.response.rect, row_resp.response.id, Sense::click());
+                                            if interact_resp.hovered() {
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                ui.painter().rect_filled(row_resp.response.rect.expand(4.0), 6.0, self.palette.accent_soft);
+                                            }
+                                            if interact_resp.on_hover_text(path_tooltip).clicked() {
+                                                self.pending.push(Cmd::OpenRecent(r.clone()));
+                                            }
+                                            ui.add_space(6.0);
+                                        }
+                                    });
+                                });
+                        }
+                    });
+                });
+                ui.add_space(40.0);
             });
-            ui.add_space(20.0);
-            let recents = self.settings.recent_paths();
-            if !recents.is_empty() {
-                ui.label(RichText::new("Recent documents").color(self.palette.faint));
-                for r in recents.iter().take(6) {
-                    if ui.button(RichText::new(r.display().to_string()).color(self.palette.link)).clicked() {
-                        self.pending.push(Cmd::OpenRecent(r.clone()));
-                    }
-                }
-            }
-        });
     }
 
     fn view_pane(&mut self, ui: &mut egui::Ui, idx: usize) {
@@ -1079,15 +1464,22 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                 d
             }
         };
-        ScrollArea::vertical()
+        let in_split = self.mode == Mode::Split && self.settings.sync_scroll;
+        let mut scroll = ScrollArea::vertical()
             .id_salt(("preview_scroll", self.buffers[idx].id))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-            ui.add_space(8.0);
+            .auto_shrink([false, false]);
+        if in_split && self.split_scroll_driver == SplitScrollDriver::Editor && self.preview_max_scroll > 0.0 {
+            scroll = scroll.vertical_scroll_offset(self.split_scroll_ratio * self.preview_max_scroll);
+        }
+        let scroll_out = scroll.show(ui, |ui| {
+            ui.add_space(14.0);
             ui.horizontal(|ui| {
-                ui.add_space(12.0);
+                let avail = ui.available_width();
+                let content_w = (avail - 48.0).clamp(320.0, 780.0);
+                let side_margin = ((avail - content_w) * 0.5).max(20.0);
+                ui.add_space(side_margin);
                 ui.vertical(|ui| {
-                    ui.set_max_width((ui.available_width() - 40.0).max(360.0));
+                    ui.set_max_width(content_w);
                     let cmds = preview::render(ui, &doc, &self.palette, base_dir.as_deref(), &mut self.images);
                     for c in cmds {
                         match c {
@@ -1106,36 +1498,54 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
             });
             ui.add_space(40.0);
         });
+        if in_split {
+            let max_view = (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
+            self.preview_max_scroll = max_view;
+            let pointer_in_preview = ui.rect_contains_pointer(scroll_out.inner_rect);
+            let scrolled = ui.input(|i| i.smooth_scroll_delta.y != 0.0);
+            if pointer_in_preview && scrolled {
+                self.split_scroll_driver = SplitScrollDriver::Preview;
+                if max_view > 0.0 {
+                    self.split_scroll_ratio = (scroll_out.state.offset.y / max_view).clamp(0.0, 1.0);
+                }
+            }
+        }
     }
 
     fn edit_pane(&mut self, ui: &mut egui::Ui, idx: usize) {
         let wrap = self.settings.wrap_editor || self.mode == Mode::Split;
         let show_nums = self.settings.show_line_numbers;
         let pal = self.palette.clone();
-        let mono_size = ui.text_style_height(&egui::TextStyle::Monospace);
-        let font = FontId::monospace(mono_size);
+        let font_size = ui.style().text_styles.get(&egui::TextStyle::Monospace).map(|f| f.size).unwrap_or(13.5);
+        let font = FontId::monospace(font_size);
         let matches = Arc::new(self.find_matches.clone());
         let len = self.buffers[idx].text.len();
 
-        let scroll = if wrap {
+        let in_split = self.mode == Mode::Split && self.settings.sync_scroll;
+        let mut scroll = if wrap {
             ScrollArea::vertical()
         } else {
             ScrollArea::both()
         };
-        scroll
+        if in_split && self.split_scroll_driver == SplitScrollDriver::Preview && self.editor_max_scroll > 0.0 {
+            scroll = scroll.vertical_scroll_offset(self.split_scroll_ratio * self.editor_max_scroll);
+        }
+        let scroll_out = scroll
             .id_salt(("editor_scroll", self.buffers[idx].id))
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.add_space(8.0);
                 ui.horizontal_top(|ui| {
                     if show_nums {
+                        ui.add_space(4.0);
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             let lines = self.buffers[idx].line_count();
                             for n in 1..=lines.min(10_000) {
-                                ui.label(RichText::new(format!("{n:>4}")).monospace().color(pal.faint).size(mono_size));
+                                ui.label(RichText::new(format!("{n:>4}")).monospace().color(pal.faint).size(font_size));
                             }
                         });
-                        ui.add_space(4.0);
+                        ui.add_space(8.0);
                     }
                     ui.push_id(("edit", self.buffers[idx].id), |ui| {
                         let is_focused = self.editor_widget.map_or(false, |id| ui.memory(|m| m.has_focus(id)));
@@ -1159,7 +1569,7 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                             .font(font.clone())
                             .desired_width(desired_w)
                             .desired_rows(10)
-                            .margin(Margin::symmetric(8, 4));
+                            .margin(Margin::symmetric(12, 6));
                         let use_syntax = len < MAX_SYNTAX_CHARS;
                         let m2 = matches.clone();
                         let mut layouter = move |ui: &egui::Ui, text: &str, width: f32| {
@@ -1202,6 +1612,18 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                     });
                 });
             });
+        if in_split {
+            let max_edit = (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
+            self.editor_max_scroll = max_edit;
+            let pointer_in_editor = ui.rect_contains_pointer(scroll_out.inner_rect);
+            let scrolled = ui.input(|i| i.smooth_scroll_delta.y != 0.0);
+            if (pointer_in_editor && scrolled) || self.split_scroll_driver == SplitScrollDriver::Editor {
+                self.split_scroll_driver = SplitScrollDriver::Editor;
+                if max_edit > 0.0 {
+                    self.split_scroll_ratio = (scroll_out.state.offset.y / max_edit).clamp(0.0, 1.0);
+                }
+            }
+        }
     }
 
     fn toast_ui(&mut self, ctx: &egui::Context) {
@@ -1211,11 +1633,16 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                 return;
             }
             egui::Area::new(egui::Id::new("toast"))
-                .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-12.0, -34.0))
+                .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -38.0))
                 .show(ctx, |ui| {
-                    egui::Frame::new().fill(self.palette.widget_bg).corner_radius(6.0).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
-                        ui.label(RichText::new(msg).color(self.palette.text));
-                    });
+                    egui::Frame::new()
+                        .fill(self.palette.widget_bg)
+                        .stroke(egui::Stroke::new(1.0, self.palette.hr))
+                        .corner_radius(8.0)
+                        .inner_margin(Margin::symmetric(14, 8))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(msg).color(self.palette.text).size(12.0));
+                        });
                 });
         }
     }
@@ -1252,6 +1679,29 @@ fn push_undo_snapshot(ctx: Option<&egui::Context>, id: Option<egui::Id>, sel: Op
 
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+
+    // 1. Proportional: Inter (embedded for pixel-perfect, crisp antialiasing everywhere)
+    fonts.font_data.insert(
+        "inter_regular".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf"))),
+    );
+    fonts.font_data.insert(
+        "inter_semibold".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf"))),
+    );
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "inter_regular".to_owned());
+    }
+
+    // 2. Monospace: JetBrains Mono (gold standard developer monospace)
+    fonts.font_data.insert(
+        "jetbrains_mono".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"))),
+    );
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        family.insert(0, "jetbrains_mono".to_owned());
+    }
+
     for c in [
         "C:\\Windows\\Fonts\\msyh.ttc",
         "C:\\Windows\\Fonts\\simhei.ttf",
@@ -1299,19 +1749,140 @@ impl App {
     fn modal_ui(&mut self, ctx: &egui::Context, modal: Modal) {
         match modal {
             Modal::About => {
-                egui::Window::new("About RustDownViewer")
+                let mut close = false;
+                egui::Window::new("RapidMD — Help & Shortcuts")
                     .collapsible(false)
-                    .resizable(false)
+                    .resizable(true)
+                    .default_width(560.0)
                     .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                     .show(ctx, |ui| {
-                        ui.label(RichText::new("RustDownViewer").strong().size(20.0).color(self.palette.accent));
-                        ui.label("Native Markdown viewer & editor written in Rust.");
-                        ui.label(RichText::new("egui/eframe · pulldown-cmark · syntect").monospace().color(self.palette.faint));
-                        ui.add_space(10.0);
-                        if ui.button("Close").clicked() || ctx.input(|i| i.key_pressed(Key::Escape)) {
-                            self.modal = None;
-                        }
+                        ScrollArea::vertical()
+                            .id_salt("help_modal_scroll")
+                            .max_height(480.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    // Header
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                                        if let Some(tex) = self.app_icon(ctx) {
+                                            let img = egui::Image::new(&tex)
+                                                .fit_to_exact_size(Vec2::new(26.0, 26.0))
+                                                .corner_radius(6.0);
+                                            ui.add(img);
+                                        }
+                                        ui.label(RichText::new("RapidMD").strong().size(22.0).color(self.palette.accent));
+                                        egui::Frame::new()
+                                            .fill(self.palette.widget_bg)
+                                            .stroke(egui::Stroke::new(1.0, self.palette.hr))
+                                            .corner_radius(5.0)
+                                            .inner_margin(egui::Margin::symmetric(6, 2))
+                                            .show(ui, |ui| {
+                                                ui.label(RichText::new("v0.1.0").monospace().color(self.palette.faint).size(10.5));
+                                            });
+                                    });
+                                    ui.add_space(2.0);
+                                    ui.label(RichText::new("Native Markdown viewer & editor with high-DPI antialiasing.").color(self.palette.faint).size(13.0));
+
+                                    ui.add_space(14.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+
+                                    // Tech Stack
+                                    ui.label(RichText::new("TECH STACK").color(self.palette.faint).size(11.0).strong());
+                                    ui.add_space(6.0);
+                                    egui::Grid::new("tech_stack_grid")
+                                        .spacing(Vec2::new(16.0, 6.0))
+                                        .striped(true)
+                                        .show(ui, |ui| {
+                                            let tech = [
+                                                ("Rust", "Safe, concurrent native systems language (2021 edition)"),
+                                                ("eframe & egui", "0.31 immediate-mode GPU-accelerated GUI with embedded Inter font"),
+                                                ("pulldown-cmark", "0.12 pull-parser for CommonMark, GFM tables & task lists"),
+                                                ("syntect", "5.3 syntax highlighter using TextMate grammars"),
+                                                ("image", "0.25 pure-Rust local image decoding (PNG, JPEG, WebP, GIF)"),
+                                                ("arboard", "3.0 cross-platform native clipboard engine"),
+                                                ("rfd", "0.15 native system file/folder dialogs"),
+                                            ];
+                                            for (k, desc) in tech {
+                                                ui.label(RichText::new(k).strong().color(self.palette.text).size(12.0));
+                                                ui.label(RichText::new(desc).color(self.palette.faint).size(12.0));
+                                                ui.end_row();
+                                            }
+                                        });
+
+                                    ui.add_space(14.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+
+                                    // Shortcuts
+                                    ui.label(RichText::new("KEYBOARD SHORTCUTS").color(self.palette.faint).size(11.0).strong());
+                                    ui.add_space(6.0);
+                                    egui::Grid::new("shortcuts_grid")
+                                        .spacing(Vec2::new(20.0, 6.0))
+                                        .striped(true)
+                                        .show(ui, |ui| {
+                                            let shortcuts = [
+                                                ("Ctrl + N", "New document"),
+                                                ("Ctrl + O", "Open file…"),
+                                                ("Ctrl + S", "Save current buffer"),
+                                                ("Ctrl + Shift + S", "Save As…"),
+                                                ("Ctrl + W", "Close active tab"),
+                                                ("Ctrl + Shift + W", "Quit application"),
+                                                ("Ctrl + 1", "View Mode (rendered preview)"),
+                                                ("Ctrl + 2", "Edit Mode (source markdown)"),
+                                                ("Ctrl + 3", "Split Mode (side-by-side with sync scroll)"),
+                                                ("Ctrl + F", "Find & Replace bar"),
+                                                ("F3 / Shift + F3", "Find next / previous match"),
+                                                ("Ctrl + G", "Go to line number"),
+                                                ("Ctrl + B", "Toggle bold selection (**bold**)"),
+                                                ("Ctrl + I", "Toggle italic selection (*italic*)"),
+                                                ("Ctrl + K", "Insert markdown link ([text](url))"),
+                                                ("Ctrl + =", "Zoom in (+10%)"),
+                                                ("Ctrl + -", "Zoom out (-10%)"),
+                                                ("Ctrl + 0", "Reset zoom (100%)"),
+                                                ("Enter", "Smart list / numbered / task continuation"),
+                                                ("F1", "Open this Help & Shortcuts dialog"),
+                                            ];
+                                            for (k, desc) in shortcuts {
+                                                egui::Frame::new()
+                                                    .fill(self.palette.widget_bg)
+                                                    .stroke(egui::Stroke::new(1.0, self.palette.hr))
+                                                    .corner_radius(4.0)
+                                                    .inner_margin(egui::Margin::symmetric(6, 2))
+                                                    .show(ui, |ui| {
+                                                        ui.label(RichText::new(k).monospace().color(self.palette.text).size(11.0).strong());
+                                                    });
+                                                ui.label(RichText::new(desc).color(self.palette.faint).size(12.0));
+                                                ui.end_row();
+                                            }
+                                        });
+
+                                    ui.add_space(14.0);
+                                });
+                            });
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let (btn_fill, btn_fg) = if self.palette.dark {
+                                (Color32::WHITE, Color32::BLACK)
+                            } else {
+                                (Color32::from_rgb(17, 17, 19), Color32::WHITE)
+                            };
+                            let close_btn = egui::Button::new(RichText::new("Close").strong().color(btn_fg).size(13.0))
+                                .fill(btn_fill)
+                                .corner_radius(6.0)
+                                .min_size(Vec2::new(90.0, 30.0));
+                            if ui.add(close_btn).clicked() || ctx.input(|i| i.key_pressed(Key::Escape)) {
+                                close = true;
+                            }
+                        });
                     });
+                if close {
+                    self.modal = None;
+                } else {
+                    self.modal = Some(Modal::About);
+                }
             }
             Modal::GoTo { idx } => {
                 let mut ok = false;
@@ -1639,7 +2210,7 @@ impl App {
                     .resizable(false)
                     .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                     .show(ctx, |ui| {
-                        ui.label("RustDownViewer did not close cleanly. Found recovered changes:");
+                        ui.label("RapidMD did not close cleanly. Found recovered changes:");
                         for (title, path, _) in &items {
                             let loc = path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "unsaved".to_owned());
                             ui.label(RichText::new(format!("• {} ({})", title, loc)).color(self.palette.warning));
@@ -1730,6 +2301,13 @@ mod tests {
             cols: 4,
             last_edit: Instant::now(),
             focus_editor: false,
+            split_scroll_ratio: 0.0,
+            split_scroll_driver: SplitScrollDriver::Editor,
+            preview_max_scroll: 0.0,
+            editor_max_scroll: 0.0,
+            last_frame_time: Instant::now(),
+            fps: 60.0,
+            icon_texture: None,
         };
         app.add_untitled();
         app
@@ -1948,5 +2526,60 @@ mod tests {
             let editor_id = app.editor_widget.expect("editor must have ID");
             assert!(ctx.memory(|m| m.has_focus(editor_id)), "Editor must automatically regain focus after toolbar action!");
         });
+    }
+
+    #[test]
+    fn test_sync_scroll_command_toggles_and_split_sync() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        assert!(app.settings.sync_scroll);
+        app.apply_cmd(Cmd::SyncScroll, &ctx);
+        assert!(!app.settings.sync_scroll);
+        app.apply_cmd(Cmd::SyncScroll, &ctx);
+        assert!(app.settings.sync_scroll);
+    }
+
+    #[test]
+    fn test_help_modal_stays_open_across_frames() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+
+        // Frame 1: trigger About
+        app.pending.push(Cmd::About);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_impl(ctx);
+        });
+        assert!(matches!(app.modal, Some(Modal::About)));
+
+        // Frame 2: modal should stay open, not disappear
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_impl(ctx);
+        });
+        assert!(matches!(app.modal, Some(Modal::About)), "Modal::About must persist across frames until closed");
+
+        // Frame 3: user presses Escape -> closes modal
+        let mut esc_input = egui::RawInput::default();
+        esc_input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(esc_input, |ctx| {
+            app.update_impl(ctx);
+        });
+        assert!(app.modal.is_none(), "Escape must dismiss the help modal");
+    }
+
+    #[test]
+    fn test_fps_counter_toggle() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        assert!(app.settings.show_fps);
+        app.apply_cmd(Cmd::ToggleFps, &ctx);
+        assert!(!app.settings.show_fps);
+        app.apply_cmd(Cmd::ToggleFps, &ctx);
+        assert!(app.settings.show_fps);
     }
 }
