@@ -1,0 +1,1952 @@
+//! Application shell: buffers, tabs, modes, panels, shortcuts, dialogs.
+//! Spec mapping documented in `docs/SPEC_COVERAGE.md`.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use eframe::egui::{
+self, Align, Align2, FontId, Key, Layout, Margin, RichText, ScrollArea, TextEdit, Vec2,
+};
+
+use crate::buffer::{Buffer, Encoding};
+use crate::config::Settings;
+use crate::dialogs::Modal;
+use crate::editor;
+use crate::find::Finder;
+use crate::format::{self, Out, TableCmd};
+use crate::io;
+use crate::md;
+use crate::preview::{self, ImageCache};
+use crate::text_utils::{byte_to_char, char_to_byte};
+use crate::theme::{Palette, ThemeMode};
+
+const MAX_SYNTAX_CHARS: usize = 250_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    View,
+    Edit,
+    Split,
+}
+
+#[derive(Clone)]
+enum Cmd {
+    New,
+    Open,
+    OpenRecent(PathBuf),
+    Save,
+    SaveAs,
+    CloseTab,
+    Quit,
+    Mode(Mode),
+    FindBar,
+    FindNext,
+    FindPrev,
+    Replace,
+    ReplaceAll,
+    Bold,
+    Italic,
+    Strike,
+    CodeSpan,
+    Heading(u8),
+    Quote,
+    Bullet,
+    Numbered,
+    Task,
+    Table,
+    TableOp(TableCmd),
+    Link,
+    Image,
+    Theme(ThemeMode),
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    Wrap,
+    Numbers,
+    GoToLine,
+    About,
+}
+
+#[derive(Clone, Copy)]
+enum BlockCmd {
+    Heading(u8),
+    Quote,
+    Bullet,
+    Numbered,
+    Task,
+}
+
+pub struct App {
+    buffers: Vec<Buffer>,
+    active: Option<usize>,
+    next_id: u64,
+    mode: Mode,
+    settings: Settings,
+    palette: Palette,
+    find: Finder,
+    find_matches: Vec<std::ops::Range<usize>>,
+    modal: Option<Modal>,
+    pending: Vec<Cmd>,
+    toast: Option<(String, Instant)>,
+    images: ImageCache,
+    doc_cache: Option<(u64, u64, Arc<md::Doc>)>,
+    sel: Option<(usize, usize)>, // char offsets, sorted
+    editor_widget: Option<egui::Id>,
+    pending_cursor: Option<egui::text::CCursorRange>,
+    ctx_handle: Option<egui::Context>,
+    link_text: String,
+    link_url: String,
+    goto: String,
+    rows: usize,
+    cols: usize,
+    last_edit: Instant,
+    focus_editor: bool,
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let settings = Settings::load();
+        install_fonts(&cc.egui_ctx);
+        let palette = Palette::get(settings.theme);
+        palette.apply(&cc.egui_ctx);
+        cc.egui_ctx.set_zoom_factor(settings.zoom);
+
+        let mut app = Self {
+            buffers: Vec::new(),
+            active: None,
+            next_id: 1,
+            mode: Mode::Edit,
+            settings,
+            palette,
+            find: Finder::default(),
+            find_matches: Vec::new(),
+            modal: None,
+            pending: Vec::new(),
+            toast: None,
+            images: ImageCache::default(),
+            doc_cache: None,
+            sel: None,
+            editor_widget: None,
+            pending_cursor: None,
+            ctx_handle: None,
+            link_text: String::new(),
+            link_url: String::new(),
+            goto: String::new(),
+            rows: 3,
+            cols: 4,
+            last_edit: Instant::now(),
+            focus_editor: false,
+        };
+        for arg in std::env::args().skip(1) {
+            let p = PathBuf::from(&arg);
+            if p.is_file() {
+                app.open_path(&p, true);
+            }
+        }
+        let items = scan_recovery();
+        if !items.is_empty() {
+            app.modal = Some(Modal::Recovery { items });
+        }
+        app
+    }
+
+    // ---------------------------------------------------------------- core
+
+    fn current(&self) -> Option<&Buffer> {
+        self.active.and_then(|i| self.buffers.get(i))
+    }
+
+    fn act_text(&self) -> Option<String> {
+        self.current().map(|b| b.text.clone())
+    }
+
+    fn sel_bytes(&self) -> std::ops::Range<usize> {
+        let t = self.act_text().unwrap_or_default();
+        match self.sel {
+            Some((a, b)) => {
+                let (lo, hi) = (a.min(b), a.max(b));
+                char_to_byte(&t, lo.min(t.chars().count()))..char_to_byte(&t, hi.min(t.chars().count()))
+            }
+            None => t.len()..t.len(),
+        }
+    }
+
+    fn add_untitled(&mut self) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.buffers.push(Buffer::untitled(id));
+        self.active = Some(self.buffers.len() - 1);
+        self.mode = Mode::Edit;
+        self.invalidate_preview();
+    }
+
+    fn remove_at(&mut self, idx: usize) {
+        if idx >= self.buffers.len() {
+            return;
+        }
+        self.buffers.remove(idx);
+        self.active = match self.active {
+            Some(a) if a == idx => (idx > 0).then_some(idx - 1).filter(|i| *i < self.buffers.len()).or(if self.buffers.is_empty() { None } else { Some(0) }),
+            Some(a) if a > idx => Some(a - 1),
+            o => o,
+        };
+        self.invalidate_preview();
+    }
+
+    fn close_tab(&mut self, idx: usize) {
+        match self.buffers.get(idx) {
+            None => {}
+            Some(b) if !b.is_dirty() => self.remove_at(idx),
+            Some(_) => self.modal = Some(Modal::CloseDirty { idx }),
+        }
+    }
+
+    fn dirty_list(&self) -> Vec<usize> {
+        self.buffers.iter().enumerate().filter(|(_, b)| b.is_dirty()).map(|(i, _)| i).collect()
+    }
+
+    fn save_at(&mut self, idx: usize) -> bool {
+        let Some(buf) = self.buffers.get_mut(idx) else { return false };
+        let Some(path) = buf.path.clone() else { return false };
+        let bytes = buf.encoded_bytes();
+        match io::atomic_save(&path, &bytes) {
+            Ok(()) => {
+                buf.mark_saved();
+                self.settings.push_recent(&path);
+                self.toast = Some((format!("Saved {}", buf.title()), Instant::now()));
+                true
+            }
+            Err(e) => {
+                self.toast = Some((format!("Save failed: {e}"), Instant::now()));
+                false
+            }
+        }
+    }
+
+    fn save_as_at(&mut self, idx: usize) -> bool {
+        let name = self.buffers.get(idx).map(|b| b.title()).unwrap_or_else(|| "document.md".into());
+        let picked = rfd::FileDialog::new().set_file_name(&name).add_filter("Markdown", &["md", "markdown", "txt"]).save_file();
+        let Some(path) = picked else { return false };
+        if self.buffers.get_mut(idx).is_none() {
+            return false;
+        }
+        self.buffers[idx].path = Some(path.clone());
+        self.buffers[idx].missing_on_disk = false;
+        self.save_at(idx)
+    }
+
+    fn open_path(&mut self, path: &Path, activate: bool) {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        if let Some(pos) = self.buffers.iter().position(|b| {
+            b.path.as_ref().and_then(|p| std::fs::canonicalize(p).ok()).map(|c| c == canon).unwrap_or(false)
+        }) {
+            if activate {
+                self.active = Some(pos);
+            }
+            return;
+        }
+        match io::read_file(path) {
+            Ok(out) => {
+                let id = self.next_id;
+                self.next_id += 1;
+                let mut b = Buffer::from_disk(id, path, out.text, out.encoding, out.read_only, out.stamp);
+                if b.encoding == Encoding::Lossy {
+                    b.title_override = Some(format!("{} (repaired)", b.title()));
+                }
+                self.buffers.push(b);
+                self.active = Some(self.buffers.len() - 1);
+                self.settings.push_recent(path);
+                self.invalidate_preview();
+            }
+            Err(e) => self.toast = Some((format!("Cannot open {}: {}", path.display(), e), Instant::now())),
+        }
+    }
+
+    fn pick_open(&mut self) {
+        if let Some(files) = rfd::FileDialog::new().add_filter("Markdown", &["md", "markdown", "txt"]).pick_files() {
+            for f in files {
+                self.open_path(&f, false);
+            }
+            if !self.buffers.is_empty() {
+                self.active = Some(self.buffers.len() - 1);
+            }
+        }
+    }
+
+    fn reload_from_disk(&mut self, idx: usize) {
+        let Some(path) = self.buffers.get(idx).and_then(|b| b.path.clone()) else { return };
+        if let Ok(out) = io::read_file(&path) {
+            let b = &mut self.buffers[idx];
+            b.text = out.text.replace("\r\n", "\n");
+            b.saved_text = b.text.clone();
+            b.encoding = out.encoding;
+            b.read_only = out.read_only;
+            b.disk_stamp = Some(out.stamp);
+            b.missing_on_disk = false;
+            self.toast = Some((format!("Reloaded {}", path.display()), Instant::now()));
+            self.invalidate_preview();
+        } else {
+            self.buffers[idx].missing_on_disk = true;
+        }
+    }
+
+    fn invalidate_preview(&mut self) {
+        self.doc_cache = None;
+    }
+
+    /// Programmatic text edit with a single native undo step (spec §8.6).
+    fn set_text(&mut self, new_text: String, new_sel: Option<std::ops::Range<usize>>) {
+        let Some(idx) = self.active else { return };
+        let before = self.buffers[idx].text.clone();
+        push_undo_snapshot(self.ctx_handle.as_ref(), self.editor_widget, self.sel, &before);
+        self.buffers[idx].text = new_text;
+        self.invalidate_preview();
+        self.focus_editor = true;
+        if let Some(sel) = new_sel {
+            let t = self.buffers[idx].text.clone();
+            let a = byte_to_char(&t, sel.start.min(t.len()));
+            let b = byte_to_char(&t, sel.end.min(t.len()));
+            self.sel = Some((a, b));
+            self.pending_cursor = Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(a.min(b)),
+                egui::text::CCursor::new(a.max(b)),
+            ));
+        }
+    }
+
+    fn apply_out(&mut self, out: Out) {
+        match out {
+            Out::Applied(op) => self.set_text(op.new_text, Some(op.selection)),
+            Out::Noop(msg) => self.toast = Some((msg.to_owned(), Instant::now())),
+        }
+    }
+
+    fn toggle_pair(&mut self, open: &str, close: &str) {
+        if let Some(t) = self.act_text() {
+            let sel = self.sel_bytes();
+            let out = format::toggle_wrap(&t, &sel, open, close);
+            self.apply_out(out);
+        }
+    }
+
+    fn block_cmd(&mut self, which: BlockCmd) {
+        let Some(t) = self.act_text() else { return };
+        let sel = self.sel_bytes();
+        let out = match which {
+            BlockCmd::Heading(l) => format::toggle_heading(&t, &sel, l),
+            BlockCmd::Quote => format::toggle_blockquote(&t, &sel),
+            BlockCmd::Bullet => format::toggle_bullet_list(&t, &sel),
+            BlockCmd::Numbered => format::toggle_numbered_list(&t, &sel),
+            BlockCmd::Task => format::toggle_task_list(&t, &sel, false),
+        };
+        self.apply_out(out);
+    }
+
+
+    fn table_op(&mut self, cmd: TableCmd) {
+        let Some(t) = self.act_text() else { return };
+        let caret = self.sel_bytes().start;
+        self.apply_out(format::table_op(&t, caret, cmd));
+    }
+    fn insert_image_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff"]).pick_file() else {
+            return;
+        };
+        if let Some(idx) = self.active {
+            let t = self.buffers[idx].text.clone();
+            let caret = self.sel_bytes().start;
+            let url = path.to_string_lossy().replace('\\', "/");
+            let op = format::insert_image(&t, caret, "", &url);
+            self.set_text(op.new_text, Some(op.selection));
+        }
+    }
+
+    fn find_refresh(&mut self) {
+        self.find_matches = match self.act_text() {
+            Some(t) => self.find.matches(&t),
+            None => Vec::new(),
+        };
+    }
+
+    fn find_goto(&mut self, next: bool) {
+        let Some(t) = self.act_text() else { return };
+        if self.find_matches.is_empty() {
+            self.find_refresh();
+            return;
+        }
+        let anchor = match self.sel {
+            Some((a, b)) => if next { a.max(b) } else { a.min(b) },
+            None => 0,
+        };
+        let m = if next {
+            self.find_matches.iter().find(|m| m.start >= anchor).or_else(|| self.find_matches.first())
+        } else {
+            self.find_matches.iter().rev().find(|m| m.end <= anchor).or_else(|| self.find_matches.last())
+        };
+        if let Some(m) = m {
+            let idx = self.active.unwrap();
+            self.set_text(t, Some(m.clone()));
+            let _ = idx;
+        }
+    }
+    fn replace_all(&mut self) {
+        let Some(t) = self.act_text() else { return };
+        let (nt, n) = self.find.replace_all(&t);
+        if n > 0 {
+            self.set_text(nt, None);
+            self.find_refresh();
+            self.toast = Some((format!("Replaced {} occurrence(s)", n), Instant::now()));
+        }
+    }
+
+    fn replace_current(&mut self) {
+        let Some(t) = self.act_text() else { return };
+        if self.find_matches.is_empty() {
+            self.find_refresh();
+            return;
+        }
+        let anchor = self.sel.map(|(a, b)| a.min(b)).unwrap_or(0);
+        let target = self
+            .find_matches
+            .iter()
+            .find(|m| m.end >= anchor)
+            .or_else(|| self.find_matches.first())
+            .cloned();
+        if let Some(m) = target {
+            let rep = self.find.replace.clone();
+            let nt = Finder::replace_at(&t, &m, &rep);
+            let new_sel = if rep.is_empty() {
+                m.start..m.start
+            } else {
+                m.start..(m.start + rep.len())
+            };
+            self.set_text(nt, Some(new_sel));
+            self.find_refresh();
+            self.toast = Some(("Replaced match".to_owned(), Instant::now()));
+        }
+    }
+
+    // ------------------------------------------------------------ shortcuts
+
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        if self.modal.is_some() {
+            return;
+        }
+        let mods = ctx.input(|i| i.modifiers);
+        let (cmd, shift) = (mods.command, mods.shift);
+        let push = |app: &mut Self, c: Cmd| app.pending.push(c);
+        let kp = |ctx: &egui::Context, k: Key| ctx.input(|i| i.key_pressed(k));
+        if cmd && kp(ctx, Key::S) && !shift {
+            push(self, Cmd::Save);
+        } else if cmd && shift && kp(ctx, Key::S) {
+            push(self, Cmd::SaveAs);
+        } else if cmd && kp(ctx, Key::O) {
+            push(self, Cmd::Open);
+        } else if cmd && kp(ctx, Key::N) {
+            push(self, Cmd::New);
+        } else if cmd && kp(ctx, Key::W) {
+            if shift {
+                push(self, Cmd::Quit);
+            } else {
+                push(self, Cmd::CloseTab);
+            }
+        } else if cmd && kp(ctx, Key::F) {
+            push(self, Cmd::FindBar);
+        } else if kp(ctx, Key::F3) && shift {
+            push(self, Cmd::FindPrev);
+        } else if kp(ctx, Key::F3) {
+            push(self, Cmd::FindNext);
+        } else if cmd && kp(ctx, Key::Num1) {
+            push(self, Cmd::Mode(Mode::View));
+        } else if cmd && kp(ctx, Key::Num2) {
+            push(self, Cmd::Mode(Mode::Edit));
+        } else if cmd && kp(ctx, Key::Num3) {
+            push(self, Cmd::Mode(Mode::Split));
+        } else if cmd && kp(ctx, Key::B) {
+            push(self, Cmd::Bold);
+        } else if cmd && kp(ctx, Key::I) {
+            push(self, Cmd::Italic);
+        } else if cmd && kp(ctx, Key::K) {
+            push(self, Cmd::Link);
+        } else if cmd && kp(ctx, Key::Equals) {
+            push(self, Cmd::ZoomIn);
+        } else if cmd && kp(ctx, Key::Minus) {
+            push(self, Cmd::ZoomOut);
+        } else if cmd && kp(ctx, Key::Num0) {
+            push(self, Cmd::ZoomReset);
+        } else if cmd && kp(ctx, Key::G) {
+            push(self, Cmd::GoToLine);
+        }
+    }
+
+    // ------------------------------------------------------------ actions
+
+    fn apply_cmd(&mut self, c: Cmd, ctx: &egui::Context) {
+        match c {
+            Cmd::New => self.add_untitled(),
+            Cmd::Open => self.pick_open(),
+            Cmd::OpenRecent(p) => self.open_path(&p, true),
+            Cmd::Save => {
+                if let Some(i) = self.active {
+                    let has_path = self.buffers[i].path.is_some();
+                    if has_path {
+                        self.save_at(i);
+                    } else {
+                        self.save_as_at(i);
+                    }
+                }
+            }
+            Cmd::SaveAs => {
+                if let Some(i) = self.active {
+                    self.save_as_at(i);
+                }
+            }
+            Cmd::CloseTab => {
+                if let Some(i) = self.active {
+                    self.close_tab(i);
+                }
+            }
+            Cmd::Quit => {
+                let dirty = self.dirty_list();
+                if dirty.is_empty() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    self.modal = Some(Modal::QuitDirty { idxs: dirty });
+                }
+            }
+            Cmd::Mode(m) => {
+                self.mode = m;
+                self.invalidate_preview();
+            }
+            Cmd::FindBar => {
+                self.find.open = !self.find.open;
+                if self.find.open {
+                    self.find_refresh();
+                }
+            }
+            Cmd::FindNext => {
+                self.find_refresh();
+                self.find_goto(true);
+            }
+            Cmd::FindPrev => {
+                self.find_refresh();
+                self.find_goto(false);
+            }
+            Cmd::Heading(l) => self.block_cmd(BlockCmd::Heading(l)),
+            Cmd::Replace => self.replace_current(),
+            Cmd::ReplaceAll => self.replace_all(),
+            Cmd::Bold => self.toggle_pair("**", "**"),
+            Cmd::Italic => self.toggle_pair("*", "*"),
+            Cmd::Strike => self.toggle_pair("~~", "~~"),
+            Cmd::CodeSpan => {
+                let t = self.act_text().unwrap_or_default();
+                let sel = self.sel_bytes();
+                if sel.is_empty() {
+                    self.toggle_pair("`", "`");
+                } else if t[sel.clone()].contains('\n') {
+                    // Spec T8: inline code cannot span lines → fenced block.
+                    let code = t[sel.clone()].to_owned();
+                    let mut nt = String::with_capacity(t.len() + 8);
+                    nt.push_str(&t[..sel.start]);
+                    nt.push_str("```\n");
+                    nt.push_str(&code);
+                    nt.push('\n');
+                    nt.push_str("```");
+                    nt.push_str(&t[sel.end..]);
+                    let inner_start = sel.start + 4;
+                    let inner_end = inner_start + code.len();
+                    self.set_text(nt, Some(inner_start..inner_end));
+                } else {
+                    self.toggle_pair("`", "`");
+                }
+            }
+            Cmd::Quote => self.block_cmd(BlockCmd::Quote),
+            Cmd::Bullet => self.block_cmd(BlockCmd::Bullet),
+            Cmd::Numbered => self.block_cmd(BlockCmd::Numbered),
+            Cmd::Task => self.block_cmd(BlockCmd::Task),
+            Cmd::Table => {
+                if let Some(idx) = self.active {
+                    self.modal = Some(Modal::TablePicker { idx });
+                }
+            }
+            Cmd::TableOp(op) => self.table_op(op),
+            Cmd::Link => {
+                if let Some(idx) = self.active {
+                    let t = self.buffers[idx].text.clone();
+                    let sel = self.sel_bytes();
+                    self.link_text = t.get(sel.clone()).unwrap_or("").to_owned();
+                    self.link_url = String::new();
+                    self.modal = Some(Modal::InsertLink { idx });
+                }
+            }
+            Cmd::Image => self.insert_image_dialog(),
+            Cmd::Theme(m) => {
+                self.settings.theme = m;
+                self.palette = Palette::get(m);
+                self.palette.apply(ctx);
+                self.images.clear();
+                self.settings.save();
+            }
+            Cmd::ZoomIn => self.zoom(1.1, ctx),
+            Cmd::ZoomOut => self.zoom(1.0 / 1.1, ctx),
+            Cmd::ZoomReset => self.zoom(1.0, ctx),
+            Cmd::Wrap => {
+                self.settings.wrap_editor = !self.settings.wrap_editor;
+                self.settings.save();
+            }
+            Cmd::Numbers => {
+                self.settings.show_line_numbers = !self.settings.show_line_numbers;
+                self.settings.save();
+            }
+            Cmd::GoToLine => {
+                self.goto = String::new();
+                self.modal = Some(Modal::GoTo { idx: self.active.unwrap_or(0) });
+            }
+            Cmd::About => self.modal = Some(Modal::About),
+        }
+    }
+
+    fn zoom(&mut self, factor: f32, ctx: &egui::Context) {
+        self.settings.zoom = (self.settings.zoom * factor).clamp(0.5, 4.0);
+        ctx.set_zoom_factor(self.settings.zoom);
+        self.settings.save();
+    }
+
+    // ------------------------------------------------------------ eframe
+
+    fn update_impl(&mut self, ctx: &egui::Context) {
+        self.ctx_handle = Some(ctx.clone());
+        self.handle_keys(ctx);
+
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.dirty_list().is_empty() {
+                clear_recovery();
+            } else {
+                self.modal = Some(Modal::QuitDirty { idxs: self.dirty_list() });
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
+
+        if ctx.input(|i| i.focused) {
+            // External-change detection (spec §8.4) on clean buffers only.
+            for i in 0..self.buffers.len() {
+                let changed = {
+                    let (Some(path), Some(stamp)) = (self.buffers.get(i).and_then(|b| b.path.clone()), self.buffers.get(i).and_then(|b| b.disk_stamp)) else {
+                        continue;
+                    };
+                    let Ok(meta) = std::fs::metadata(&path) else { continue };
+                    stamp.changed_vs(&crate::buffer::DiskStamp::from_meta(&meta))
+                };
+                if changed && self.buffers[i].is_dirty() && !self.buffers[i].suppress_external_change_once {
+                    if self.modal.is_none() {
+                        self.modal = Some(Modal::ExternalChanged { idx: i });
+                    }
+                } else if changed && !self.buffers[i].is_dirty() {
+                    self.reload_from_disk(i);
+                }
+            }
+        }
+
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|d| d.path.clone()).collect());
+        for p in dropped {
+            self.open_path(&p, true);
+        }
+
+        self.recovery_tick();
+
+        let modal = self.modal.take();
+
+        egui::TopBottomPanel::top("menu").exact_height(26.0).show(ctx, |ui| {
+            ui.add_enabled_ui(modal.is_none(), |ui| self.menu_row(ui));
+        });
+        egui::TopBottomPanel::top("tool").exact_height(32.0).show(ctx, |ui| {
+            ui.add_enabled_ui(modal.is_none(), |ui| self.tool_row(ui));
+        });
+        if self.buffers.len() > 1 {
+            egui::TopBottomPanel::top("tabs").exact_height(24.0).show(ctx, |ui| {
+                ui.add_enabled_ui(modal.is_none(), |ui| self.tab_row(ui));
+            });
+        }
+        if self.find.open && self.active.is_some() {
+            egui::TopBottomPanel::top("find").exact_height(28.0).show(ctx, |ui| {
+                ui.add_enabled_ui(modal.is_none(), |ui| self.find_row(ui));
+            });
+        }
+        egui::TopBottomPanel::bottom("status").exact_height(22.0).show(ctx, |ui| {
+            ui.add_enabled_ui(modal.is_none(), |ui| self.status_row(ui));
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_enabled_ui(modal.is_none(), |ui| {
+                if let Some(i) = self.active {
+                    match self.mode {
+                        Mode::View => self.view_pane(ui, i),
+                        Mode::Edit => self.edit_pane(ui, i),
+                        Mode::Split => {
+                            egui::SidePanel::left("split")
+                                .resizable(true)
+                                .min_width(120.0)
+                                .max_width((ui.available_width() - 120.0).max(120.0))
+                                .default_width(ui.available_width() * 0.5)
+                                .show_inside(ui, |ui| self.edit_pane(ui, i));
+                            self.view_pane(ui, i);
+                        }
+                    }
+                } else {
+                    self.welcome(ui);
+                }
+            });
+        });
+
+        self.toast_ui(ctx);
+        if let Some(m) = modal {
+            let screen_rect = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("modal_backdrop")));
+            painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(100));
+            self.modal_ui(ctx, m);
+        }
+        self.flush(ctx);
+    }
+
+    fn flush(&mut self, ctx: &egui::Context) {
+        let acts = std::mem::take(&mut self.pending);
+        for a in acts {
+            self.apply_cmd(a, ctx);
+        }
+    }
+
+    fn recovery_tick(&mut self) {
+        if self.last_edit.elapsed().as_secs() < 2 || self.dirty_list().is_empty() {
+            return;
+        }
+        let dir = recovery_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        for (i, b) in self.buffers.iter().enumerate() {
+            if !b.is_dirty() {
+                continue;
+            }
+            let v = serde_json::json!({
+                "title": b.title(),
+                "path": b.path.as_ref().map(|p| p.display().to_string()),
+                "text": b.text,
+            });
+            let _ = std::fs::write(dir.join(format!("buf-{}.json", i)), serde_json::to_string(&v).unwrap_or_default());
+        }
+    }
+
+    // ------------------------------------------------------------ UI pieces
+
+    fn menu_row(&mut self, ui: &mut egui::Ui) {
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("New").clicked() {
+                    self.pending.push(Cmd::New);
+                    ui.close_menu();
+                }
+                if ui.button("Open…").clicked() {
+                    self.pending.push(Cmd::Open);
+                    ui.close_menu();
+                }
+                ui.separator();
+                let recents = self.settings.recent_paths();
+                if !recents.is_empty() {
+                    ui.menu_button("Open Recent", |ui| {
+                        for r in recents {
+                            if ui.button(r.display().to_string()).clicked() {
+                                self.pending.push(Cmd::OpenRecent(r));
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                if ui.button("Save").clicked() {
+                    self.pending.push(Cmd::Save);
+                    ui.close_menu();
+                }
+                if ui.button("Save As…").clicked() {
+                    self.pending.push(Cmd::SaveAs);
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Close Tab").clicked() {
+                    self.pending.push(Cmd::CloseTab);
+                    ui.close_menu();
+                }
+                if ui.button("Quit").clicked() {
+                    self.pending.push(Cmd::Quit);
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui.button("Find / Replace").clicked() {
+                    self.pending.push(Cmd::FindBar);
+                    ui.close_menu();
+                }
+                if ui.button("Go to Line…").clicked() {
+                    self.pending.push(Cmd::GoToLine);
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("View", |ui| {
+                if ui.selectable_label(self.mode == Mode::View, "View  Ctrl+1").clicked() {
+                    self.pending.push(Cmd::Mode(Mode::View));
+                    ui.close_menu();
+                }
+                if ui.selectable_label(self.mode == Mode::Edit, "Edit  Ctrl+2").clicked() {
+                    self.pending.push(Cmd::Mode(Mode::Edit));
+                    ui.close_menu();
+                }
+                if ui.selectable_label(self.mode == Mode::Split, "Split  Ctrl+3").clicked() {
+                    self.pending.push(Cmd::Mode(Mode::Split));
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.menu_button("Theme", |ui| {
+                    for t in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::System] {
+                        if ui.selectable_label(self.settings.theme == t, t.label()).clicked() {
+                            self.pending.push(Cmd::Theme(t));
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.separator();
+                if ui.selectable_label(self.settings.wrap_editor, "Wrap editor text").clicked() {
+                    self.pending.push(Cmd::Wrap);
+                    ui.close_menu();
+                }
+                if ui.selectable_label(self.settings.show_line_numbers, "Line numbers").clicked() {
+                    self.pending.push(Cmd::Numbers);
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Zoom In").clicked() {
+                    self.pending.push(Cmd::ZoomIn);
+                    ui.close_menu();
+                }
+                if ui.button("Zoom Out").clicked() {
+                    self.pending.push(Cmd::ZoomOut);
+                    ui.close_menu();
+                }
+                if ui.button("Reset zoom").clicked() {
+                    self.pending.push(Cmd::ZoomReset);
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("Help", |ui| {
+                if ui.button("About RustDownViewer").clicked() {
+                    self.pending.push(Cmd::About);
+                    ui.close_menu();
+                }
+                if ui.button("Open FEATURES_AND_SCENARIOS.md").clicked() {
+                    let p = std::env::current_dir().unwrap_or_default().join("docs").join("FEATURES_AND_SCENARIOS.md");
+                    if p.exists() {
+                        self.pending.push(Cmd::Open);
+                        let _ = p;
+                    }
+                }
+            });
+        });
+    }
+
+    fn tool_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.mode, Mode::View, "View");
+            ui.selectable_value(&mut self.mode, Mode::Edit, "Edit");
+            ui.selectable_value(&mut self.mode, Mode::Split, "Split");
+            ui.separator();
+            if ui.button("New").clicked() {
+                self.pending.push(Cmd::New);
+            }
+            if ui.button("Open").clicked() {
+                self.pending.push(Cmd::Open);
+            }
+            if ui.button("Save").clicked() {
+                self.pending.push(Cmd::Save);
+            }
+            ui.separator();
+            let editing = self.mode != Mode::View && self.active.is_some();
+            ui.add_enabled_ui(editing, |ui| {
+                if ui.button("B").on_hover_text("Bold").clicked() {
+                    self.pending.push(Cmd::Bold);
+                }
+                if ui.button("I").on_hover_text("Italic").clicked() {
+                    self.pending.push(Cmd::Italic);
+                }
+                if ui.button(RichText::new("S").strikethrough()).on_hover_text("Strikethrough").clicked() {
+                    self.pending.push(Cmd::Strike);
+                }
+                if ui.button("`x`").on_hover_text("Inline code").clicked() {
+                    self.pending.push(Cmd::CodeSpan);
+                }
+                ui.separator();
+                if ui.button("H1").on_hover_text("Heading 1").clicked() {
+                    self.pending.push(Cmd::Heading(1));
+                }
+                if ui.button("H2").on_hover_text("Heading 2").clicked() {
+                    self.pending.push(Cmd::Heading(2));
+                }
+                if ui.button("H3").on_hover_text("Heading 3").clicked() {
+                    self.pending.push(Cmd::Heading(3));
+                }
+                if ui.button("❝").on_hover_text("Blockquote").clicked() {
+                    self.pending.push(Cmd::Quote);
+                }
+                if ui.button("•").on_hover_text("Bullet list").clicked() {
+                    self.pending.push(Cmd::Bullet);
+                }
+                if ui.button("1.").on_hover_text("Numbered list").clicked() {
+                    self.pending.push(Cmd::Numbered);
+                }
+                if ui.button("☑").on_hover_text("Task list").clicked() {
+                    self.pending.push(Cmd::Task);
+                }
+                ui.separator();
+                if ui.button("Link").clicked() {
+                    self.pending.push(Cmd::Link);
+                }
+                if ui.button("Image").clicked() {
+                    self.pending.push(Cmd::Image);
+                }
+                if ui.button("Table").clicked() {
+                    self.pending.push(Cmd::Table);
+                }
+                ui.menu_button("Rows/Cols", |ui| {
+                    if ui.button("Row above").clicked() {
+                        self.pending.push(Cmd::TableOp(TableCmd::InsertRowAbove));
+                    }
+                    if ui.button("Row below").clicked() {
+                        self.pending.push(Cmd::TableOp(TableCmd::InsertRowBelow));
+                    }
+                    if ui.button("Column left").clicked() {
+                        self.pending.push(Cmd::TableOp(TableCmd::InsertColLeft));
+                    }
+                    if ui.button("Column right").clicked() {
+                        self.pending.push(Cmd::TableOp(TableCmd::InsertColRight));
+                    }
+                    ui.separator();
+                    if ui.button("Delete row").clicked() {
+                        self.pending.push(Cmd::TableOp(TableCmd::DeleteRow));
+                    }
+                    if ui.button("Delete column").clicked() {
+                        self.pending.push(Cmd::TableOp(TableCmd::DeleteCol));
+                    }
+                });
+            });
+        });
+    }
+
+    fn tab_row(&mut self, ui: &mut egui::Ui) {
+        ScrollArea::horizontal()
+            .id_salt("tabs_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let titles: Vec<(String, bool)> = self.buffers.iter().map(|b| (b.title(), b.is_dirty())).collect();
+                    let count = titles.len();
+                    for (i, (name, dirty)) in titles.iter().enumerate() {
+                        let label = if *dirty { format!("● {}", name) } else { name.clone() };
+                        if ui.selectable_label(self.active == Some(i), label).clicked() {
+                            self.active = Some(i);
+                            self.invalidate_preview();
+                        }
+                        if ui.small_button("×").clicked() {
+                            self.close_tab(i);
+                        }
+                        if i + 1 < count {
+                            ui.separator();
+                        }
+                    }
+                });
+            });
+    }
+
+    fn find_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Find").color(self.palette.faint));
+            let changed = ui.add(TextEdit::singleline(&mut self.find.query).desired_width(200.0).hint_text("search…")).changed();
+            ui.checkbox(&mut self.find.case_sensitive, "Aa");
+            if ui.button("↑").clicked() {
+                self.pending.push(Cmd::FindPrev);
+            }
+            if ui.button("↓").clicked() {
+                self.pending.push(Cmd::FindNext);
+            }
+            ui.separator();
+            ui.label(RichText::new("Replace").color(self.palette.faint));
+            ui.add(TextEdit::singleline(&mut self.find.replace).desired_width(140.0));
+            if ui.button("Replace").clicked() {
+                self.pending.push(Cmd::Replace);
+            }
+            if ui.button("All").clicked() {
+                self.pending.push(Cmd::ReplaceAll);
+            }
+            if ui.button("✕").clicked() {
+                self.find.open = false;
+                self.find_matches.clear();
+            }
+            if changed {
+                self.find_refresh();
+            }
+        });
+    }
+
+    fn status_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if let Some(b) = self.current() {
+                let state = if b.missing_on_disk {
+                    "missing"
+                } else if b.read_only {
+                    "read-only"
+                } else if b.is_dirty() {
+                    "modified"
+                } else {
+                    "saved"
+                };
+                let color = if b.is_dirty() { self.palette.warning } else { self.palette.success };
+                ui.label(RichText::new(state).color(color).strong());
+ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
+                if b.encoding != Encoding::Utf8 {
+                    ui.label(RichText::new(b.encoding.label()).color(self.palette.faint).monospace().size(11.0));
+                }
+                ui.label(RichText::new(if b.eol == crate::buffer::Eol::Crlf { "CRLF" } else { "LF" }).color(self.palette.faint).size(11.0));
+                let t = b.text.clone();
+                let (ln, col) = match self.sel {
+                    Some((a, _)) => editor::line_col(&t, char_to_byte(&t, a)),
+                    None => (1, 1),
+                };
+                ui.separator();
+                ui.label(RichText::new(format!("Ln {}, Col {}", ln, col)).monospace().color(self.palette.faint).size(11.0));
+                ui.label(RichText::new(format!("Words: {}", b.word_count())).color(self.palette.faint).size(11.0));
+            } else {
+                ui.label(RichText::new("No document open").color(self.palette.faint));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(format!("{}%", (self.settings.zoom * 100.0).round() as i32)).monospace().color(self.palette.faint).size(11.0));
+                ui.label(RichText::new(match self.mode {
+                    Mode::View => "View",
+                    Mode::Edit => "Edit",
+                    Mode::Split => "Split",
+                }).color(self.palette.faint).size(11.0));
+            });
+        });
+    }
+
+    fn welcome(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.2);
+            ui.label(RichText::new("RustDownViewer").strong().size(38.0).color(self.palette.accent));
+            ui.label(RichText::new("Native Markdown viewer & editor").color(self.palette.faint).size(16.0));
+            ui.add_space(26.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                if ui.add(egui::Button::new(RichText::new("Open File…").size(16.0)).min_size(Vec2::new(140.0, 42.0))).clicked() {
+                    self.pending.push(Cmd::Open);
+                }
+                if ui.add(egui::Button::new(RichText::new("New File").size(16.0)).min_size(Vec2::new(140.0, 42.0))).clicked() {
+                    self.pending.push(Cmd::New);
+                }
+            });
+            ui.add_space(20.0);
+            let recents = self.settings.recent_paths();
+            if !recents.is_empty() {
+                ui.label(RichText::new("Recent documents").color(self.palette.faint));
+                for r in recents.iter().take(6) {
+                    if ui.button(RichText::new(r.display().to_string()).color(self.palette.link)).clicked() {
+                        self.pending.push(Cmd::OpenRecent(r.clone()));
+                    }
+                }
+            }
+        });
+    }
+
+    fn view_pane(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let base_dir = self.buffers[idx].path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let text = self.buffers[idx].text.clone();
+        let hash = fnv64(&text);
+        let doc = match self.doc_cache.clone() {
+            Some((cid, h, d)) if cid == self.buffers[idx].id && h == hash => d,
+            _ => {
+                if text.chars().count() > 4_000_000 {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("File is too large to preview. Use Edit mode.").color(self.palette.warning));
+                    });
+                    return;
+                }
+                let d = Arc::new(md::parse(&text));
+                self.doc_cache = Some((self.buffers[idx].id, hash, d.clone()));
+                d
+            }
+        };
+        ScrollArea::vertical()
+            .id_salt(("preview_scroll", self.buffers[idx].id))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.set_max_width((ui.available_width() - 40.0).max(360.0));
+                    let cmds = preview::render(ui, &doc, &self.palette, base_dir.as_deref(), &mut self.images);
+                    for c in cmds {
+                        match c {
+                            preview::Cmd::OpenUrl(u) => {
+                                let _ = open::that(u);
+                            }
+                            preview::Cmd::OpenFile(p) => {
+                                let _ = open::that(p);
+                            }
+                            preview::Cmd::Reveal(p) => {
+                                let _ = open::that(p.parent().map(|d| d.to_path_buf()).unwrap_or_default());
+                            }
+                        }
+                    }
+                });
+            });
+            ui.add_space(40.0);
+        });
+    }
+
+    fn edit_pane(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let wrap = self.settings.wrap_editor || self.mode == Mode::Split;
+        let show_nums = self.settings.show_line_numbers;
+        let pal = self.palette.clone();
+        let mono_size = ui.text_style_height(&egui::TextStyle::Monospace);
+        let font = FontId::monospace(mono_size);
+        let matches = Arc::new(self.find_matches.clone());
+        let len = self.buffers[idx].text.len();
+
+        let scroll = if wrap {
+            ScrollArea::vertical()
+        } else {
+            ScrollArea::both()
+        };
+        scroll
+            .id_salt(("editor_scroll", self.buffers[idx].id))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    if show_nums {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let lines = self.buffers[idx].line_count();
+                            for n in 1..=lines.min(10_000) {
+                                ui.label(RichText::new(format!("{n:>4}")).monospace().color(pal.faint).size(mono_size));
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
+                    ui.push_id(("edit", self.buffers[idx].id), |ui| {
+                        let is_focused = self.editor_widget.map_or(false, |id| ui.memory(|m| m.has_focus(id)));
+                        let enter_pressed = ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift && !i.modifiers.command && !i.modifiers.alt);
+                        if is_focused && enter_pressed {
+                            let sel = self.sel_bytes();
+                            if sel.is_empty() {
+                                if let Some(op) = format::smart_enter(&self.buffers[idx].text, sel.start) {
+                                    ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+                                    self.set_text(op.new_text, Some(op.selection));
+                                    self.last_edit = Instant::now();
+                                    if self.find.open {
+                                        self.find_refresh();
+                                    }
+                                }
+                            }
+                        }
+                        let avail_w = ui.available_width();
+                        let desired_w = if wrap { avail_w.max(80.0) } else { f32::INFINITY };
+                        let mut te = TextEdit::multiline(&mut self.buffers[idx].text)
+                            .font(font.clone())
+                            .desired_width(desired_w)
+                            .desired_rows(10)
+                            .margin(Margin::symmetric(8, 4));
+                        let use_syntax = len < MAX_SYNTAX_CHARS;
+                        let m2 = matches.clone();
+                        let mut layouter = move |ui: &egui::Ui, text: &str, width: f32| {
+                            let max_w = if wrap { width.min(avail_w).max(80.0) } else { f32::INFINITY };
+                            let mut job = if use_syntax {
+                                editor::editor_job(text, &pal, font.clone(), &m2)
+                            } else {
+                                egui::text::LayoutJob::simple(text.to_owned(), font.clone(), pal.text, max_w)
+                            };
+                            job.wrap.max_width = max_w;
+                            job.wrap.break_anywhere = true;
+                            ui.fonts(|f| f.layout_job(job))
+                        };
+                        te = te.layouter(&mut layouter);
+                        let out = te.show(ui);
+                        self.editor_widget = Some(out.response.id);
+                        if let Some(pc) = self.pending_cursor.take() {
+                            let s = pc.sorted();
+                            self.sel = Some((s[0].index, s[1].index));
+                            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), out.response.id) {
+                                st.cursor.set_char_range(Some(pc));
+                                st.store(ui.ctx(), out.response.id);
+                            }
+                            out.response.request_focus();
+                            self.focus_editor = false;
+                        } else if self.focus_editor {
+                            out.response.request_focus();
+                            self.focus_editor = false;
+                        } else if let Some(r) = out.cursor_range {
+                            let s = r.sorted_cursors();
+                            self.sel = Some((s[0].ccursor.index, s[1].ccursor.index));
+                        }
+                        if out.response.changed() {
+                            self.invalidate_preview();
+                            self.last_edit = Instant::now();
+                            if self.find.open {
+                                self.find_refresh();
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
+    fn toast_ui(&mut self, ctx: &egui::Context) {
+        if let Some((msg, at)) = self.toast.clone() {
+            if at.elapsed().as_secs_f32() > 5.0 {
+                self.toast = None;
+                return;
+            }
+            egui::Area::new(egui::Id::new("toast"))
+                .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-12.0, -34.0))
+                .show(ctx, |ui| {
+                    egui::Frame::new().fill(self.palette.widget_bg).corner_radius(6.0).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                        ui.label(RichText::new(msg).color(self.palette.text));
+                    });
+                });
+        }
+    }
+}
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_impl(ctx);
+    }
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.settings.save();
+        clear_recovery();
+    }
+}
+
+fn fnv64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn push_undo_snapshot(ctx: Option<&egui::Context>, id: Option<egui::Id>, sel: Option<(usize, usize)>, text: &str) {
+    use eframe::egui::text::{CCursor, CCursorRange};
+    let (Some(ctx), Some(id)) = (ctx, id) else { return };
+    let (a, b) = sel.unwrap_or((0, 0));
+    let range = CCursorRange::two(CCursor::new(a.min(b)), CCursor::new(a.max(b)));
+    if let Some(st) = egui::TextEdit::load_state(ctx, id) {
+        st.undoer().add_undo(&(range, text.to_owned()));
+        st.store(ctx, id);
+    }
+}
+
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    for c in [
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ] {
+        if let Ok(bytes) = std::fs::read(c) {
+fonts.font_data.insert("cjk".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts.families.get_mut(&family).unwrap().push("cjk".to_owned());
+            }
+            break;
+        }
+    }
+    crate::theme::register_bold_family(&mut fonts);
+    ctx.set_fonts(fonts);
+}
+
+fn recovery_dir() -> PathBuf {
+    Settings::config_dir().join("recovery")
+}
+
+fn scan_recovery() -> Vec<(String, Option<PathBuf>, String)> {
+    let Ok(entries) = std::fs::read_dir(recovery_dir()) else { return Vec::new() };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        if let Ok(s) = std::fs::read_to_string(e.path()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                let title = v["title"].as_str().unwrap_or("recovered document").to_owned();
+                let path = v["path"].as_str().map(PathBuf::from);
+                let text = v["text"].as_str().unwrap_or("").to_owned();
+                out.push((title, path, text));
+            }
+        }
+    }
+    out
+}
+
+fn clear_recovery() {
+    let _ = std::fs::remove_dir_all(recovery_dir());
+}
+
+impl App {
+    /// Render the single app-modal (spec §6.12, §7.2, §8.1) and resolve it.
+    fn modal_ui(&mut self, ctx: &egui::Context, modal: Modal) {
+        match modal {
+            Modal::About => {
+                egui::Window::new("About RustDownViewer")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.label(RichText::new("RustDownViewer").strong().size(20.0).color(self.palette.accent));
+                        ui.label("Native Markdown viewer & editor written in Rust.");
+                        ui.label(RichText::new("egui/eframe · pulldown-cmark · syntect").monospace().color(self.palette.faint));
+                        ui.add_space(10.0);
+                        if ui.button("Close").clicked() || ctx.input(|i| i.key_pressed(Key::Escape)) {
+                            self.modal = None;
+                        }
+                    });
+            }
+            Modal::GoTo { idx } => {
+                let mut ok = false;
+                let mut cancel = false;
+                egui::Window::new("Go to line")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.add(TextEdit::singleline(&mut self.goto).desired_width(180.0).hint_text("line number"));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new("Go").strong()).clicked() {
+                                ok = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                        if ctx.input(|i| i.key_pressed(Key::Enter)) {
+                            ok = true;
+                        }
+                        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                            cancel = true;
+                        }
+                    });
+                if ok {
+                    if let Ok(n) = self.goto.trim().parse::<usize>() {
+                        let t = self.act_text().unwrap_or_default();
+                        let byte = line_nth_byte(&t, n.saturating_sub(1));
+                        let ch = byte_to_char(&t, byte);
+                        self.sel = Some((ch, ch));
+                        let cc = egui::text::CCursorRange::two(egui::text::CCursor::new(ch), egui::text::CCursor::new(ch));
+                        self.pending_cursor = Some(cc);
+                    }
+                    self.modal = None;
+                } else if cancel {
+                    self.modal = None;
+                } else {
+                    self.modal = Some(Modal::GoTo { idx });
+                }
+            }
+            Modal::CloseDirty { idx } => {
+                let title = self.buffers.get(idx).map(|b| b.title()).unwrap_or_default();
+                let mut choice = 0u8;
+                egui::Window::new("Unsaved changes")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.label(format!("Save changes to \u{201C}{}\u{201D} before closing?", title));
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new("Save").strong()).clicked() {
+                                choice = 1;
+                            }
+                            if ui.button("Discard").clicked() {
+                                choice = 2;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                choice = 3;
+                            }
+                        });
+                        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                            choice = 3;
+                        }
+                    });
+                match choice {
+                    1 => {
+                        let has_path = self.buffers.get(idx).map(|b| b.path.is_some()).unwrap_or(false);
+                        let saved = if has_path { self.save_at(idx) } else { self.save_as_at(idx) };
+                        if saved {
+                            self.remove_at(idx);
+                            self.modal = None;
+                        } else {
+                            self.modal = Some(Modal::CloseDirty { idx });
+                        }
+                    }
+                    2 => {
+                        self.remove_at(idx);
+                        self.modal = None;
+                    }
+                    _ => self.modal = Some(Modal::CloseDirty { idx }),
+                }
+            }
+            Modal::QuitDirty { idxs } => {
+                let names: Vec<String> = idxs.iter().filter_map(|&i| self.buffers.get(i).map(|b| b.title())).collect();
+                let mut choice = 0u8;
+                egui::Window::new("Unsaved changes")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.label("The following documents have unsaved changes:");
+                        for n in &names {
+                            ui.label(RichText::new(format!("• {}", n)).color(self.palette.warning));
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new("Save All").strong()).clicked() {
+                                choice = 1;
+                            }
+                            if ui.button("Discard All").clicked() {
+                                choice = 2;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                choice = 3;
+                            }
+                        });
+                        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                            choice = 3;
+                        }
+                    });
+                match choice {
+                    1 => {
+                        for &i in &idxs {
+                            let has_path = self.buffers.get(i).map(|b| b.path.is_some()).unwrap_or(false);
+                            let ok = if has_path { self.save_at(i) } else { self.save_as_at(i) };
+                            if !ok {
+                                self.modal = Some(Modal::QuitDirty { idxs: self.dirty_list() });
+                                return;
+                            }
+                        }
+                        self.modal = None;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    2 => {
+                        let mut removed = 0usize;
+                        for i in idxs {
+                            self.remove_at(i - removed);
+                            removed += 1;
+                        }
+                        self.modal = None;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    _ => self.modal = Some(Modal::QuitDirty { idxs: self.dirty_list() }),
+                }
+            }
+            Modal::ExternalChanged { idx } => {
+                let title = self.buffers.get(idx).map(|b| b.title()).unwrap_or_default();
+                let mut choice = 0u8;
+                egui::Window::new("File changed on disk")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.label(format!("\u{201C}{}\u{201D} was modified by another program.", title));
+                        ui.label("Reload the file, or keep your edits and overwrite later?");
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new("Reload").strong()).clicked() {
+                                choice = 1;
+                            }
+                            if ui.button("Keep Mine").clicked() {
+                                choice = 2;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                choice = 3;
+                            }
+                        });
+                    });
+                match choice {
+                    1 => {
+                        self.reload_from_disk(idx);
+                        self.modal = None;
+                    }
+                    2 => {
+                        if let Some(b) = self.buffers.get_mut(idx) {
+                            b.suppress_external_change_once = true;
+                        }
+                        self.modal = None;
+                    }
+                    _ => self.modal = Some(Modal::ExternalChanged { idx }),
+                }
+            }
+            Modal::InsertLink { idx } => {
+                let mut ok = false;
+                let mut cancel = false;
+                egui::Window::new("Insert Link")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.label("Text");
+                        ui.add(TextEdit::singleline(&mut self.link_text).desired_width(320.0));
+                        ui.label("URL");
+                        ui.add(TextEdit::singleline(&mut self.link_url).desired_width(320.0).hint_text("https://…"));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new("Insert").strong()).clicked() {
+                                ok = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                        if ctx.input(|i| i.key_pressed(Key::Enter)) {
+                            ok = true;
+                        }
+                        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                            cancel = true;
+                        }
+                    });
+                if ok {
+                    let t = self.act_text().unwrap_or_default();
+                    let caret = self.sel_bytes().start;
+                    let op = format::insert_link(&t, caret, &self.link_text, &self.link_url);
+                    self.set_text(op.new_text, Some(op.selection));
+                    self.link_text.clear();
+                    self.link_url.clear();
+                    self.modal = None;
+                } else if cancel {
+                    self.link_text.clear();
+                    self.link_url.clear();
+                    self.modal = None;
+                } else {
+                    self.modal = Some(Modal::InsertLink { idx });
+                }
+            }
+            Modal::InsertImage { idx, path } => {
+                let mut ok = false;
+                let mut cancel = false;
+                egui::Window::new("Insert Image")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.label(format!("File: {}", path.display()));
+                        ui.label(RichText::new("Insert a Markdown image reference.").color(self.palette.faint));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new("Insert").strong()).clicked() {
+                                ok = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if ok {
+                    let t = self.act_text().unwrap_or_default();
+                    let caret = self.sel_bytes().start;
+                    let url = path.to_string_lossy().replace('\\', "/");
+                    let op = format::insert_image(&t, caret, "", &url);
+                    self.set_text(op.new_text, Some(op.selection));
+                    self.modal = None;
+                } else if cancel {
+                    self.modal = None;
+                } else {
+                    self.modal = Some(Modal::InsertImage { idx, path });
+                }
+            }
+            Modal::TablePicker { idx } => {
+                let mut ok = false;
+                let mut cancel = false;
+                egui::Window::new("Insert Table")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Rows:");
+                            if ui.small_button("-").clicked() && self.rows > 1 {
+                                self.rows -= 1;
+                            }
+                            ui.add(egui::DragValue::new(&mut self.rows).range(1..=20));
+                            if ui.small_button("+").clicked() && self.rows < 20 {
+                                self.rows += 1;
+                            }
+                            ui.add_space(8.0);
+                            ui.label("Columns:");
+                            if ui.small_button("-").clicked() && self.cols > 1 {
+                                self.cols -= 1;
+                            }
+                            ui.add(egui::DragValue::new(&mut self.cols).range(1..=12));
+                            if ui.small_button("+").clicked() && self.cols < 12 {
+                                self.cols += 1;
+                            }
+                        });
+                        ui.add_space(6.0);
+                        for r in 0..self.rows {
+                            ui.horizontal(|ui| {
+                                for c in 0..self.cols {
+                                    if ui.add(egui::Button::new(RichText::new("▢").color(self.palette.accent)).min_size(Vec2::new(12.0, 12.0))).clicked() {
+                                        self.rows = r + 1;
+                                        self.cols = c + 1;
+                                    }
+                                }
+                            });
+                        }
+                        ui.label(format!("{} × {}", self.rows, self.cols));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new("Insert").strong()).clicked() {
+                                ok = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                        if ctx.input(|i| i.key_pressed(Key::Enter)) {
+                            ok = true;
+                        }
+                        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                            cancel = true;
+                        }
+                    });
+                if ok {
+                    let t = self.act_text().unwrap_or_default();
+                    let caret = self.sel_bytes().start;
+                    let op = format::insert_table(&t, caret, self.rows, self.cols);
+                    self.set_text(op.new_text, Some(op.selection));
+                    self.modal = None;
+                } else if cancel {
+                    self.modal = None;
+                } else {
+                    self.modal = Some(Modal::TablePicker { idx });
+                }
+            }
+            Modal::Recovery { items } => {
+                let mut recover = false;
+                let mut discard = false;
+                egui::Window::new("Recover unsaved documents")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.label("RustDownViewer did not close cleanly. Found recovered changes:");
+                        for (title, path, _) in &items {
+                            let loc = path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "unsaved".to_owned());
+                            ui.label(RichText::new(format!("• {} ({})", title, loc)).color(self.palette.warning));
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new("Recover All").strong()).clicked() {
+                                recover = true;
+                            }
+                            if ui.button("Discard").clicked() {
+                                discard = true;
+                            }
+                        });
+                    });
+                if recover {
+                    for (title, path, text) in items {
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        let mut b = Buffer::untitled(id);
+                        b.title_override = Some(title);
+                        b.path = path;
+                        b.text = text;
+                        self.buffers.push(b);
+                    }
+                    if !self.buffers.is_empty() {
+                        self.active = Some(self.buffers.len() - 1);
+                    }
+                    clear_recovery();
+                    self.modal = None;
+                } else if discard {
+                    clear_recovery();
+                    self.modal = None;
+                } else {
+                    self.modal = Some(Modal::Recovery { items });
+                }
+            }
+        }
+    }
+}
+
+fn line_nth_byte(text: &str, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut seen = 0usize;
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            seen += 1;
+            if seen == n {
+                return i + 1;
+            }
+        }
+    }
+    text.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_app(ctx: &egui::Context) -> App {
+        install_fonts(ctx);
+        let settings = Settings::default();
+        let palette = Palette::get(settings.theme);
+        palette.apply(ctx);
+        let mut app = App {
+            buffers: Vec::new(),
+            active: None,
+            next_id: 1,
+            mode: Mode::Edit,
+            settings,
+            palette,
+            find: Finder::default(),
+            find_matches: Vec::new(),
+            modal: None,
+            pending: Vec::new(),
+            toast: None,
+            images: ImageCache::default(),
+            doc_cache: None,
+            sel: None,
+            editor_widget: None,
+            pending_cursor: None,
+            ctx_handle: None,
+            link_text: String::new(),
+            link_url: String::new(),
+            goto: String::new(),
+            rows: 3,
+            cols: 4,
+            last_edit: Instant::now(),
+            focus_editor: false,
+        };
+        app.add_untitled();
+        app
+    }
+
+    #[test]
+    fn test_app_smart_enter_bullet_flow() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.buffers[0].text = "- first".to_string();
+        app.sel = Some((7, 7));
+
+        // Frame 1: render editor, request focus
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_impl(ctx);
+            if let Some(id) = app.editor_widget {
+                ctx.memory_mut(|m| m.request_focus(id));
+            }
+        });
+
+        // Frame 2: press enter on "- first"
+        let mut raw_enter = egui::RawInput::default();
+        raw_enter.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(raw_enter, |ctx| {
+            app.update_impl(ctx);
+        });
+        assert_eq!(app.buffers[0].text, "- first\n- ");
+
+        // Frame 3: press enter again on empty bullet "- "
+        let mut raw_enter2 = egui::RawInput::default();
+        raw_enter2.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(raw_enter2, |ctx| {
+            app.update_impl(ctx);
+        });
+        // Empty bullet is removed!
+        assert_eq!(app.buffers[0].text, "- first\n");
+    }
+
+    #[test]
+    fn test_app_smart_enter_numbered_flow() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.buffers[0].text = "1. first".to_string();
+        app.sel = Some((8, 8));
+
+        // Frame 1: render editor, request focus
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_impl(ctx);
+            if let Some(id) = app.editor_widget {
+                ctx.memory_mut(|m| m.request_focus(id));
+            }
+        });
+
+        // Frame 2: press enter on "1. first"
+        let mut raw_enter = egui::RawInput::default();
+        raw_enter.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(raw_enter, |ctx| {
+            app.update_impl(ctx);
+        });
+        assert_eq!(app.buffers[0].text, "1. first\n2. ");
+
+        // Frame 3: press enter again on empty "2. "
+        let mut raw_enter2 = egui::RawInput::default();
+        raw_enter2.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(raw_enter2, |ctx| {
+            app.update_impl(ctx);
+        });
+        assert_eq!(app.buffers[0].text, "1. first\n");
+    }
+
+    #[test]
+    fn test_app_h3_heading_toggle() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.buffers[0].text = "section title".to_string();
+        app.sel = Some((0, 0));
+        app.pending.push(Cmd::Heading(3));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_impl(ctx);
+        });
+        assert_eq!(app.buffers[0].text, "### section title");
+    }
+
+    #[test]
+    fn test_app_table_commands_no_crash() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        // Pre-populate with a table in markdown text
+        app.buffers[0].text = "# Title\n\n| Column 1 | Column 2 |\n| --- | --- |\n| row1_a | row1_b |\n".to_string();
+        let cell_pos = app.buffers[0].text.find("row1_a").unwrap();
+        app.sel = Some((cell_pos, cell_pos));
+
+        // 1. Insert row above
+        app.pending.push(Cmd::TableOp(TableCmd::InsertRowAbove));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        assert!(app.buffers[0].text.lines().count() >= 6);
+
+        // 2. Insert row below
+        app.pending.push(Cmd::TableOp(TableCmd::InsertRowBelow));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        assert!(app.buffers[0].text.lines().count() >= 7);
+
+        // 3. Insert column left
+        app.pending.push(Cmd::TableOp(TableCmd::InsertColLeft));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+
+        // 4. Insert column right
+        app.pending.push(Cmd::TableOp(TableCmd::InsertColRight));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+
+        // 5. Delete row
+        app.pending.push(Cmd::TableOp(TableCmd::DeleteRow));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+
+        // 6. Delete column
+        app.pending.push(Cmd::TableOp(TableCmd::DeleteCol));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+    }
+
+    #[test]
+    fn test_modal_no_blackout() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.modal = Some(Modal::TablePicker { idx: 0 });
+
+        // Frame renders with modal active: editor_widget and panels should still be created
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_impl(ctx);
+        });
+
+        assert!(app.modal.is_some(), "modal remains open");
+        assert!(app.editor_widget.is_some(), "editor widget was rendered underneath the modal");
+    }
+
+    #[test]
+    fn test_tab_bar_no_gap_and_layout() {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0)));
+        let mut app = create_test_app(&ctx);
+        app.add_untitled();
+        let _ = ctx.run(raw.clone(), |ctx| {
+            app.update_impl(ctx);
+        });
+        let _ = ctx.run(raw, |ctx| {
+            app.update_impl(ctx);
+            let avail = ctx.available_rect();
+            assert!(avail.min.y <= 90.0, "tabs panel height must be compact without black gap, got min.y={}", avail.min.y);
+        });
+    }
+
+    #[test]
+    fn test_split_mode_editor_wraps_text() {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)));
+        let mut app = create_test_app(&ctx);
+        app.mode = Mode::Split;
+        // Even if wrap_editor is explicitly disabled in settings, split mode forces wrap
+        app.settings.wrap_editor = false;
+        app.buffers[0].text = "This is a very long line of text that should wrap inside the split pane editor instead of extending past the split boundary and getting hidden by the preview pane on the right.".to_string();
+
+        let _ = ctx.run(raw, |ctx| {
+            app.update_impl(ctx);
+            // The editor widget should have been rendered and its ID recorded
+            assert!(app.editor_widget.is_some());
+        });
+    }
+
+    #[test]
+    fn test_toolbar_click_refocuses_editor() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.buffers[0].text = "my heading".to_string();
+        app.sel = Some((0, 0));
+
+        // Frame 1: render app
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_impl(ctx);
+        });
+
+        // User clicks H3 on toolbar:
+        app.pending.push(Cmd::Heading(3));
+
+        // Frame 2: app runs flush, applies Heading(3), edit_pane renders and calls request_focus
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_impl(ctx);
+        });
+        // Frame 3: edit_pane runs with focus_editor = true and requests focus
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_impl(ctx);
+            let editor_id = app.editor_widget.expect("editor must have ID");
+            assert!(ctx.memory(|m| m.has_focus(editor_id)), "Editor must automatically regain focus after toolbar action!");
+        });
+    }
+}
