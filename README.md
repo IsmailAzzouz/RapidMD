@@ -3,7 +3,7 @@
 <div align="center">
   <img src="assets/Icon/RMD.png" alt="RapidMD Logo" width="96" height="96" style="border-radius: 18px;" />
   <h3>Sleek, Native Markdown Viewer & Editor in Rust</h3>
-  <p>Minimalist monochrome interface inspired by Tesla vehicle UI and Notion workspace aesthetics.</p>
+  <p>Minimalist monochrome interface and workspace aesthetics.</p>
 
   [![Rust](https://img.shields.io/badge/Rust-2021%20Edition-black?logo=rust)](https://www.rust-lang.org/)
   [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-black)](https://github.com/ismail/RustDownViewer)
