@@ -379,7 +379,11 @@ fn render_blockquote(
         QuoteKind::Caution | QuoteKind::Warning => Color32::from(pal.quote_bg).linear_multiply(1.08),
         _ => pal.quote_bg,
     };
-let frame = Frame::new().fill(fill).corner_radius(6.0).inner_margin(Margin::symmetric(12, 8));
+    let frame = Frame::new()
+        .fill(fill)
+        .corner_radius(8.0)
+        .stroke(egui::Stroke::new(1.0, pal.hr))
+        .inner_margin(Margin::symmetric(14, 10));
     frame.show(ui, |ui| {
         if let Some(label) = kind.label() {
             let accent = match kind {
@@ -395,8 +399,8 @@ ui.label(egui::RichText::new(label).strong().color(accent).size(base * 0.78));
         }
         ui.horizontal(|ui| {
             let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(3.0, 1.0), Sense::hover());
-            let _ = bar_rect;
-            ui.add_space(4.0);
+            ui.painter().rect_filled(bar_rect, 1.5, pal.quote_bar);
+            ui.add_space(6.0);
             ui.vertical(|ui| {
                 ui.set_max_width(ui.available_width() - 8.0);
                 for (i, b) in items.iter().enumerate() {
@@ -431,10 +435,12 @@ fn render_list(
                 let s = (row_h * 0.52).max(12.0);
                 let r = Rect::from_center_size(c, Vec2::splat(s));
                 if checked {
-                    ui.painter().rect_filled(r, 3.0, pal.check);
-                    ui.painter().text(c, egui::Align2::CENTER_CENTER, "✓", FontId::proportional(base * 0.78), Color32::WHITE);
+                    let fill_col = if pal.dark { Color32::WHITE } else { Color32::BLACK };
+                    let tick_col = if pal.dark { Color32::BLACK } else { Color32::WHITE };
+                    ui.painter().rect_filled(r, 3.5, fill_col);
+                    ui.painter().text(c, egui::Align2::CENTER_CENTER, "✓", FontId::proportional(base * 0.76), tick_col);
                 } else {
-                    ui.painter().rect_stroke(r, 3.0, Stroke::new(1.4, pal.faint), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(r, 3.5, Stroke::new(1.2, pal.faint), egui::StrokeKind::Inside);
                 }
             } else if ordered {
                 let text = format!("{}.", i + 1);
@@ -442,7 +448,7 @@ fn render_list(
                 let g = ui.fonts(|f| f.layout_no_wrap(text.clone(), font, pal.faint));
                 ui.painter().galley(Pos2::new(mrect.right() - g.size().x, mrect.center().y - g.size().y * 0.5), g, pal.faint);
             } else {
-                ui.painter().circle_filled(Pos2::new(mrect.left() + marker_w * 0.4, mrect.center().y), 3.2, pal.md_list);
+                ui.painter().circle_filled(Pos2::new(mrect.left() + marker_w * 0.4, mrect.center().y), 2.8, pal.faint);
             }
             ui.vertical(|ui| {
                 ui.set_max_width((ui.available_width() - marker_w).max(80.0));
@@ -459,7 +465,11 @@ fn render_list(
 fn render_code(ui: &mut egui::Ui, code: &str, lang: &str, pal: &Palette, base: f32) {
     let font_size = base * 0.92;
     let job = code_job(code, lang, pal, font_size);
-let frame = Frame::new().fill(pal.code_fence_bg).corner_radius(8.0).inner_margin(Margin::symmetric(12, 10));
+    let frame = Frame::new()
+        .fill(pal.code_fence_bg)
+        .corner_radius(8.0)
+        .stroke(egui::Stroke::new(1.0, pal.hr))
+        .inner_margin(Margin::symmetric(14, 10));
     frame.show(ui, |ui| {
         if !lang.is_empty() {
 ui.label(egui::RichText::new(lang).monospace().color(pal.faint).size(base * 0.72));
@@ -475,7 +485,7 @@ ui.label(egui::RichText::new(lang).monospace().color(pal.faint).size(base * 0.72
 
 fn render_table(ui: &mut egui::Ui, table: &Table, pal: &Palette, base: f32, _cmds: &mut Vec<Cmd>) {
     egui::ScrollArea::horizontal().id_salt("tbl").auto_shrink([false, true]).show(ui, |ui| {
-let grid = egui::Grid::new("preview-table").spacing(Vec2::new(20.0, 5.0)).striped(true).min_col_width(30.0);
+        let grid = egui::Grid::new("preview-table").spacing(Vec2::new(24.0, 7.0)).striped(true).min_col_width(30.0);
         let _ = &pal;
         grid.show(ui, |ui| {
             for cell in &table.header {

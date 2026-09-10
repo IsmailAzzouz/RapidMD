@@ -12,6 +12,14 @@ pub struct Settings {
     pub wrap_editor: bool,
     pub show_line_numbers: bool,
     pub recent: Vec<String>,
+    #[serde(default = "default_true")]
+    pub sync_scroll: bool,
+    #[serde(default = "default_true")]
+    pub show_fps: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -22,6 +30,8 @@ impl Default for Settings {
             wrap_editor: true,
             show_line_numbers: true,
             recent: Vec::new(),
+            sync_scroll: true,
+            show_fps: true,
         }
     }
 }
