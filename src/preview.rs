@@ -202,7 +202,10 @@ fn spans_to_job(spans: &[Span], pal: &Palette, size: f32, color: Color32) -> (La
                     job.append(&t, 0.0, fmt);
                     *chars += t.chars().count();
                 }
-                Span::Image { .. } => { /* images render as blocks; see split() */ }
+                Span::Image { alt, .. } => {
+                    let label = if alt.is_empty() { "image" } else { alt.as_str() };
+                    append_run(job, chars, &format!("⬡ {} ", label), crate::md::Style::default(), pal, size * 0.9, pal.accent);
+                }
             }
         }
     }
@@ -359,7 +362,15 @@ fn render_block(
             ui.add_space(4.0);
         }
         Block::Html(_) => {
-ui.label(egui::RichText::new("HTML block (not rendered — Markdown only)").color(pal.faint).italics().size(base * 0.8));
+            // HTML blocks are now pre-parsed in md.rs into structured blocks.
+            // Defensive fallback for unparsed blocks:
+        }
+        Block::Center(items) => {
+            ui.vertical_centered(|ui| {
+                for it in items {
+                    render_block(ui, it, pal, base, base_dir, images, cmds);
+                }
+            });
         }
         Block::FootnoteDef { .. } => { /* hoisted; rendered at doc end */ }
     }
@@ -505,8 +516,8 @@ fn render_table(ui: &mut egui::Ui, table: &Table, pal: &Palette, base: f32, _cmd
 }
 
 fn render_image(ui: &mut egui::Ui, sp: &Span, base_dir: Option<&Path>, images: &mut ImageCache, cmds: &mut Vec<Cmd>) {
-    let (url, alt) = match sp {
-        Span::Image { url, alt, .. } => (url.clone(), alt.clone()),
+    let (url, alt, width, height) = match sp {
+        Span::Image { url, alt, width, height, .. } => (url.clone(), alt.clone(), *width, *height),
         _ => return,
     };
     ui.add_space(4.0);
@@ -533,9 +544,31 @@ fn render_image(ui: &mut egui::Ui, sp: &Span, base_dir: Option<&Path>, images: &
     };
     let avail = ui.available_width().max(40.0);
     let sz = tex.size_vec2();
-    let scale = (avail / sz.x).min(1.0);
-    let size = Vec2::new((sz.x * scale).max(24.0), (sz.y * scale).max(24.0));
-    let img = egui::Image::new(&tex).fit_to_exact_size(size).sense(Sense::click());
+    let (target_w, target_h) = match (width, height) {
+        (Some(w), Some(h)) => {
+            let scale = (avail / w).min(1.0);
+            (w * scale, h * scale)
+        }
+        (Some(w), None) => {
+            let scale = (avail / w).min(1.0);
+            let ws = w * scale;
+            (ws, sz.y * (ws / sz.x))
+        }
+        (None, Some(h)) => {
+            let w = sz.x * (h / sz.y);
+            let scale = (avail / w).min(1.0);
+            (w * scale, h * scale)
+        }
+        (None, None) => {
+            let scale = (avail / sz.x).min(1.0);
+            (sz.x * scale, sz.y * scale)
+        }
+    };
+    let size = Vec2::new(target_w.max(16.0), target_h.max(16.0));
+    let img = egui::Image::new(&tex)
+        .fit_to_exact_size(size)
+        .corner_radius(12.0)
+        .sense(Sense::click());
     let resp = ui.add(img);
     if resp.double_clicked() {
         cmds.push(Cmd::OpenFile(path.clone()));

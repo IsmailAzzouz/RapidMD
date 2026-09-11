@@ -6,6 +6,7 @@ pub mod editor;
 pub mod find;
 pub mod format;
 pub mod highlight;
+pub mod html;
 pub mod io;
 pub mod md;
 pub mod preview;

@@ -27,7 +27,13 @@ pub enum Span {
     /// Clickable link; inner spans keep their styling.
     Link { url: String, title: Option<String>, inner: Vec<Span> },
     /// Image reference; `alt` doubles as tooltip.
-    Image { url: String, alt: String, title: Option<String> },
+    Image {
+        url: String,
+        alt: String,
+        title: Option<String>,
+        width: Option<f32>,
+        height: Option<f32>,
+    },
     /// Hard line break inside a paragraph.
     LineBreak,
     /// `[^label]` reference.
@@ -89,6 +95,7 @@ pub enum Block {
     Rule,
     Html(String),
     FootnoteDef { label: String, blocks: Vec<Block> },
+    Center(Vec<Block>),
 }
 
 pub struct Doc {
@@ -316,22 +323,31 @@ fn own_event(ev: Event<'_>) -> Event<'static> {
 
 fn parse_blocks(evs: &mut EvQueue<'_>, end: &EndFn) -> Vec<Block> {
     let mut out: Vec<Block> = Vec::new();
+    let mut center_stack: Vec<Vec<Block>> = Vec::new();
+
+    let push_b = |out: &mut Vec<Block>, center_stack: &mut Vec<Vec<Block>>, b: Block| {
+        if let Some(target) = center_stack.last_mut() {
+            target.push(b);
+        } else {
+            out.push(b);
+        }
+    };
     while let Some(ev) = evs.next() {
         match ev {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {
                     let spans = parse_spans(evs, &|t| same_kind(t, &TagEnd::Paragraph));
-                    out.push(Block::Para(spans));
+                    push_b(&mut out, &mut center_stack, Block::Para(spans));
                 }
                 Tag::Heading { level, .. } => {
                     let lvl = level;
                     let spans = parse_spans(evs, &move |t| same_kind(t, &TagEnd::Heading(lvl)));
-                    out.push(Block::Heading { level: lvl as u8, spans });
+                    push_b(&mut out, &mut center_stack, Block::Heading { level: lvl as u8, spans });
                 }
                 Tag::BlockQuote(kind) => {
                     let kind = quote_kind(kind);
                     let items = parse_blocks(evs, &|t| same_kind(t, &TagEnd::BlockQuote(None)));
-                    out.push(Block::BlockQuote { kind, items });
+                    push_b(&mut out, &mut center_stack, Block::BlockQuote { kind, items });
                 }
                 Tag::List(start) => {
                     let ordered = start.is_some();
@@ -358,7 +374,7 @@ fn parse_blocks(evs: &mut EvQueue<'_>, end: &EndFn) -> Vec<Block> {
                             None => break,
                         }
                     }
-                    out.push(Block::List { ordered, items });
+                    push_b(&mut out, &mut center_stack, Block::List { ordered, items });
                 }
                 Tag::CodeBlock(kind) => {
                     let mut code = String::new();
@@ -373,7 +389,7 @@ fn parse_blocks(evs: &mut EvQueue<'_>, end: &EndFn) -> Vec<Block> {
                         CodeBlockKind::Fenced(l) => l.to_string(),
                         CodeBlockKind::Indented => String::new(),
                     };
-                    out.push(Block::CodeBlock { lang, code });
+                    push_b(&mut out, &mut center_stack, Block::CodeBlock { lang, code });
                 }
                 Tag::Table(aligns) => {
                     let aligns: Vec<ColAlign> = aligns
@@ -419,11 +435,11 @@ fn parse_blocks(evs: &mut EvQueue<'_>, end: &EndFn) -> Vec<Block> {
                     if header.is_empty() && !rows.is_empty() {
                         header = rows.remove(0);
                     }
-                    out.push(Block::Table(Table { aligns, header, rows }));
+                    push_b(&mut out, &mut center_stack, Block::Table(Table { aligns, header, rows }));
                 }
                 Tag::FootnoteDefinition(label) => {
                     let blocks = parse_blocks(evs, &|t| same_kind(t, &TagEnd::FootnoteDefinition));
-                    out.push(Block::FootnoteDef { label: label.to_string(), blocks });
+                    push_b(&mut out, &mut center_stack, Block::FootnoteDef { label: label.to_string(), blocks });
                 }
                 Tag::HtmlBlock => {
                     let mut html = String::new();
@@ -434,20 +450,37 @@ fn parse_blocks(evs: &mut EvQueue<'_>, end: &EndFn) -> Vec<Block> {
                             _ => {}
                         }
                     }
-                    out.push(Block::Html(html));
+                    let actions = crate::html::parse_html_block_content(&html);
+                    for act in actions {
+                        match act {
+                            crate::html::HtmlBlockAction::OpenCenter => {
+                                center_stack.push(Vec::new());
+                            }
+                            crate::html::HtmlBlockAction::CloseCenter => {
+                                if let Some(children) = center_stack.pop() {
+                                    if !children.is_empty() {
+                                        push_b(&mut out, &mut center_stack, Block::Center(children));
+                                    }
+                                }
+                            }
+                            crate::html::HtmlBlockAction::Block(blk) => {
+                                push_b(&mut out, &mut center_stack, blk);
+                            }
+                        }
+                    }
                 }
                 tag @ (Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } | Tag::Image { .. }) => {
                     // Loose inline content that never got a Paragraph container
                     // (pulldown omits it for tight list items).
                     evs.unshift(Event::Start(tag));
                     let spans = gather_inline_para(evs);
-                    out.push(Block::Para(spans));
+                    push_b(&mut out, &mut center_stack, Block::Para(spans));
                 }
                 _ => {
                     // Unknown container: skip defensively.
                 }
             },
-            Event::Rule => out.push(Block::Rule),
+            Event::Rule => push_b(&mut out, &mut center_stack, Block::Rule),
             Event::End(te) => {
                 if end(&te) {
                     break;
@@ -463,9 +496,34 @@ fn parse_blocks(evs: &mut EvQueue<'_>, end: &EndFn) -> Vec<Block> {
                 // Tight list item content arrives as bare text without Paragraph.
                 evs.unshift(ev);
                 let spans = gather_inline_para(evs);
-                out.push(Block::Para(spans));
+                push_b(&mut out, &mut center_stack, Block::Para(spans));
+            }
+            Event::Html(h) | Event::InlineHtml(h) => {
+                let actions = crate::html::parse_html_block_content(&h);
+                for act in actions {
+                    match act {
+                        crate::html::HtmlBlockAction::OpenCenter => {
+                            center_stack.push(Vec::new());
+                        }
+                        crate::html::HtmlBlockAction::CloseCenter => {
+                            if let Some(children) = center_stack.pop() {
+                                if !children.is_empty() {
+                                    push_b(&mut out, &mut center_stack, Block::Center(children));
+                                }
+                            }
+                        }
+                        crate::html::HtmlBlockAction::Block(blk) => {
+                            push_b(&mut out, &mut center_stack, blk);
+                        }
+                    }
+                }
             }
             _ => {}
+        }
+    }
+    while let Some(children) = center_stack.pop() {
+        if !children.is_empty() {
+            push_b(&mut out, &mut center_stack, Block::Center(children));
         }
     }
     out
@@ -530,11 +588,20 @@ fn parse_spans_styled(
     link_url: Option<(String, Option<String>)>,
 ) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
+    let mut current_style = style;
+    let mut html_style_stack: Vec<Style> = Vec::new();
     while let Some(ev) = evs.next() {
         match ev {
-            Event::Text(t) => out.push(Span::Text { text: t.to_string(), style }),
+            Event::Text(t) => {
+                let decoded = crate::html::decode_entities(&t);
+                if current_style.code {
+                    out.push(Span::Code { text: decoded, style: current_style });
+                } else {
+                    out.push(Span::Text { text: decoded, style: current_style });
+                }
+            }
             Event::Code(c) => {
-                let s = merge(style, Style { code: true, ..Style::default() });
+                let s = merge(current_style, Style { code: true, ..Style::default() });
                 out.push(Span::Code { text: c.to_string(), style: s });
             }
             Event::SoftBreak => { /* spaces keep words apart; wrap does the rest */ }
@@ -542,6 +609,67 @@ fn parse_spans_styled(
             Event::InlineMath(m) => out.push(Span::Math { text: m.to_string() }),
             Event::DisplayMath(m) => out.push(Span::Math { text: m.to_string() }),
             Event::FootnoteReference(l) => out.push(Span::FootnoteRef { label: l.to_string() }),
+            Event::InlineHtml(h) | Event::Html(h) => {
+                let toks = crate::html::tokenize_html(&h);
+                for tok in &toks {
+                    match tok {
+                        crate::html::HtmlToken::TagOpen { name, attrs, .. } => {
+                            match name.as_str() {
+                                "b" | "strong" => {
+                                    html_style_stack.push(current_style);
+                                    current_style.bold = true;
+                                }
+                                "i" | "em" => {
+                                    html_style_stack.push(current_style);
+                                    current_style.italic = true;
+                                }
+                                "s" | "del" | "strike" => {
+                                    html_style_stack.push(current_style);
+                                    current_style.strike = true;
+                                }
+                                "code" | "kbd" => {
+                                    html_style_stack.push(current_style);
+                                    current_style.code = true;
+                                }
+                                "br" => {
+                                    out.push(Span::LineBreak);
+                                }
+                                "img" => {
+                                    let url = crate::html::get_attr(attrs, "src").unwrap_or("").to_string();
+                                    let alt = crate::html::get_attr(attrs, "alt").unwrap_or("").to_string();
+                                    let title = crate::html::get_attr(attrs, "title").map(|s| s.to_string());
+                                    let width = crate::html::get_attr(attrs, "width").and_then(crate::html::parse_dimension);
+                                    let height = crate::html::get_attr(attrs, "height").and_then(crate::html::parse_dimension);
+                                    out.push(Span::Image { url, alt, title, width, height });
+                                }
+                                _ => {}
+                            }
+                        }
+                        crate::html::HtmlToken::TagClose { name } => {
+                            if let Some(prev) = html_style_stack.pop() {
+                                current_style = prev;
+                            } else {
+                                match name.as_str() {
+                                    "b" | "strong" => current_style.bold = false,
+                                    "i" | "em" => current_style.italic = false,
+                                    "s" | "del" | "strike" => current_style.strike = false,
+                                    "code" | "kbd" => current_style.code = false,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        crate::html::HtmlToken::Text(t) => {
+                            if !t.is_empty() {
+                                if current_style.code {
+                                    out.push(Span::Code { text: t.clone(), style: current_style });
+                                } else {
+                                    out.push(Span::Text { text: t.clone(), style: current_style });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Event::Start(tag) => match tag {
                 Tag::Emphasis => {
                     let s = merge(style, Style { italic: true, ..Style::default() });
@@ -579,7 +707,13 @@ fn parse_spans_styled(
                         }
                     }
                     let title = if title.is_empty() { None } else { Some(title.to_string()) };
-                    out.push(Span::Image { url: dest_url.to_string(), alt, title });
+                    out.push(Span::Image {
+                        url: dest_url.to_string(),
+                        alt,
+                        title,
+                        width: None,
+                        height: None,
+                    });
                 }
                 tag => {
                     if is_block_start(&tag) {
@@ -624,6 +758,7 @@ fn collect_toc(blocks: &[Block], toc: &mut Vec<(u8, String, String)>) {
                         walk(&item.blocks, toc, seen);
                     }
                 }
+                Block::Center(items) => walk(items, toc, seen),
                 _ => {}
             }
         }
@@ -722,5 +857,40 @@ mod tests {
         let doc6 = parse(md6);
         let Block::Para(spans6) = &doc6.blocks[0] else { panic!() };
         assert!(matches!(&spans6[0], Span::Image { .. }));
+    }
+
+    #[test]
+    fn test_readme_header_full_parse() {
+        let md = r#"# RapidMD ⚡
+
+<div align="center">
+  <img src="assets/Icon/RMD.png" alt="RapidMD Logo" width="96" height="96" style="border-radius: 18px;" />
+  <h3>Sleek, Native Markdown Viewer & Editor in Rust</h3>
+  <p>Minimalist monochrome interface and workspace aesthetics.</p>
+
+  [![Rust](https://img.shields.io/badge/Rust-2021%20Edition-black?logo=rust)](https://www.rust-lang.org/)
+</div>
+
+---
+"#;
+        let doc = parse(md);
+        assert_eq!(doc.blocks.len(), 3); // H1, Center, Rule
+        assert!(matches!(&doc.blocks[0], Block::Heading { level: 1, .. }));
+        let Block::Center(center_items) = &doc.blocks[1] else { panic!("expected Center block") };
+        assert_eq!(center_items.len(), 4); // image para, H3, description para, badges para
+        assert!(matches!(&center_items[0], Block::Para(spans) if matches!(&spans[0], Span::Image { width: Some(96.0), height: Some(96.0), .. })));
+        assert!(matches!(&center_items[1], Block::Heading { level: 3, .. }));
+        assert!(matches!(&center_items[2], Block::Para(_)));
+        assert!(matches!(&center_items[3], Block::Para(_)));
+        assert!(matches!(&doc.blocks[2], Block::Rule));
+    }
+
+    #[test]
+    fn test_inline_html_in_markdown() {
+        let md = "Press <kbd>Ctrl+S</kbd> to save. Here is <b>bold</b> text.";
+        let doc = parse(md);
+        let Block::Para(spans) = &doc.blocks[0] else { panic!("expected para") };
+        assert!(spans.iter().any(|s| matches!(s, Span::Code { text, .. } if text == "Ctrl+S")));
+        assert!(spans.iter().any(|s| matches!(s, Span::Text { style, text } if style.bold && text == "bold")));
     }
 }
