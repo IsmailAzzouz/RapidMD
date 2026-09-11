@@ -42,17 +42,42 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFile
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\Icon\RMD.ico"; Tasks: desktopicon
 
 [Registry]
-; File association for .md
-Root: HKA; Subkey: "Software\Classes\.md"; ValueType: string; ValueName: ""; ValueData: "RapidMD.Document"; Flags: uninsdeletevalue; Tasks: associate_md
-Root: HKA; Subkey: "Software\Classes\.markdown"; ValueType: string; ValueName: ""; ValueData: "RapidMD.Document"; Flags: uninsdeletevalue; Tasks: associate_md
-Root: HKA; Subkey: "Software\Classes\RapidMD.Document"; ValueType: string; ValueName: ""; ValueData: "Markdown Document"; Flags: uninsdeletekey; Tasks: associate_md
-Root: HKA; Subkey: "Software\Classes\RapidMD.Document\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\assets\Icon\RMD.ico,0"; Tasks: associate_md
-Root: HKA; Subkey: "Software\Classes\RapidMD.Document\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Tasks: associate_md
+; 1. Application Registration (makes RapidMD known to Windows Open With and App model)
+Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}"; ValueType: string; ValueName: ""; ValueData: "RapidMD"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RapidMD"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\assets\Icon\RMD.ico"""; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".md"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".markdown"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey
 
-; Context Menu "Open with RapidMD" for any markdown file
-Root: HKA; Subkey: "Software\Classes\*\shell\OpenWithRapidMD"; ValueType: string; ValueName: ""; ValueData: "Open with RapidMD"; Flags: uninsdeletekey; Tasks: associate_md
-Root: HKA; Subkey: "Software\Classes\*\shell\OpenWithRapidMD"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\assets\Icon\RMD.ico,0"; Tasks: associate_md
-Root: HKA; Subkey: "Software\Classes\*\shell\OpenWithRapidMD\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Tasks: associate_md
+; 2. ProgID Registration for RapidMD.Document
+Root: HKA; Subkey: "Software\Classes\RapidMD.Document"; ValueType: string; ValueName: ""; ValueData: "Markdown Document"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RapidMD.Document"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "Markdown Document"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RapidMD.Document\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\assets\Icon\RMD.ico"""; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RapidMD.Document\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RapidMD.Document\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RapidMD"; Flags: uninsdeletekey
+
+; 3. File extension registrations (Associate ProgID & OpenWithProgids)
+Root: HKA; Subkey: "Software\Classes\.md"; ValueType: string; ValueName: ""; ValueData: "RapidMD.Document"; Flags: uninsdeletevalue; Tasks: associate_md
+Root: HKA; Subkey: "Software\Classes\.md\OpenWithProgids"; ValueType: string; ValueName: "RapidMD.Document"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.markdown"; ValueType: string; ValueName: ""; ValueData: "RapidMD.Document"; Flags: uninsdeletevalue; Tasks: associate_md
+Root: HKA; Subkey: "Software\Classes\.markdown\OpenWithProgids"; ValueType: string; ValueName: "RapidMD.Document"; ValueData: ""; Flags: uninsdeletevalue
+
+; 4. SystemFileAssociations for Context Menu ("Open with RapidMD" on right-click)
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\.md\shell\OpenWithRapidMD"; ValueType: string; ValueName: ""; ValueData: "Open with RapidMD"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\.md\shell\OpenWithRapidMD"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\assets\Icon\RMD.ico"""; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\.md\shell\OpenWithRapidMD\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\.markdown\shell\OpenWithRapidMD"; ValueType: string; ValueName: ""; ValueData: "Open with RapidMD"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\.markdown\shell\OpenWithRapidMD"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\assets\Icon\RMD.ico"""; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\.markdown\shell\OpenWithRapidMD\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey
+
+; 5. Windows Default Programs Capabilities registration (Settings -> Apps -> Default Apps)
+Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "RapidMD"; ValueData: "Software\RapidMD\Capabilities"; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\RapidMD\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "RapidMD"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\RapidMD\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "RapidMD Markdown Viewer and Editor"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\RapidMD\Capabilities"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\assets\Icon\RMD.ico,0"""; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\RapidMD\Capabilities\FileAssociations"; ValueType: string; ValueName: ".md"; ValueData: "RapidMD.Document"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\RapidMD\Capabilities\FileAssociations"; ValueType: string; ValueName: ".markdown"; ValueData: "RapidMD.Document"; Flags: uninsdeletekey
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

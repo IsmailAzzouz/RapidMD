@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
 use rustdown_viewer::app::App;
