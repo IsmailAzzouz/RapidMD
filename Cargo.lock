@@ -2959,6 +2959,7 @@ dependencies = [
  "dirs 5.0.1",
  "eframe",
  "image",
+ "memmap2",
  "open",
  "pulldown-cmark",
  "rfd",

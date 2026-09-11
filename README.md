@@ -7,7 +7,7 @@
 
   [![Rust](https://img.shields.io/badge/Rust-2021%20Edition-black?logo=rust)](https://www.rust-lang.org/)
   [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-black)](https://github.com/ismail/RustDownViewer)
-  [![License: MIT](https://img.shields.io/badge/License-MIT-black.svg)](LICENSE)
+  [![License: MIT](https://img.shields.io/badge/License-MIT-black.svg)](https://github.com/IsmailAzzouz/RapidMD/blob/main/Cargo.toml)
   [![GUI](https://img.shields.io/badge/GUI-egui%200.31-black)](https://github.com/emilk/egui)
 </div>
 
@@ -22,6 +22,7 @@
 ## Key Highlights
 
 - **Tesla & Notion-Inspired Monochrome Design**: Built entirely on deep obsidian blacks (`#0C0D0F`), neutral graphites, crisp whites, and subtle hairline borders. No distracting rainbow themes.
+- **Ultra-Lean Resource Footprint**: Optimized to use only **~40 MB of RAM** at idle. Employs on-demand memory mapping (`memmap2`) for glyph fallbacks and zero-cost text scanning, delivering instantaneous launch times.
 - **Embedded Modern Typography**: Bundles **Inter** (Regular, SemiBold, Bold) for prose and **JetBrains Mono** for code and line metrics, paired with active tessellation antialiasing feathering and whole-pixel snapping.
 - **Synchronized Split View**: Side-by-side editing and preview with bidirectional proportional scroll synchronization—scrolling either pane keeps the other aligned in real time.
 - **GitHub Flavored Markdown (GFM)**: Tables, interactive task list checkboxes, blockquotes with graphite indicator bars, local image decoding (PNG, JPEG, WebP, GIF), and syntect syntax-highlighted code fences.
@@ -37,13 +38,14 @@
 
 Download the ready-to-run setup wizard:
 
-👉 **[Download RapidMD-Setup-v0.1.0.exe](installer/dist/RapidMD-Setup-v0.1.0.exe)** *(~6.2 MB)*
+👉 **[Download RapidMD-Setup-v0.1.0.exe (Latest Release)](https://github.com/IsmailAzzouz/RapidMD/releases/download/v0.1.0/RapidMD-Setup-v0.1.0.exe)** *(~6.2 MB)*
 
 #### What the Installer Does:
 - Installs RapidMD into `Program Files` (or `%LocalAppData%\Programs\RapidMD`).
-- Creates **Desktop** and **Start Menu** shortcuts with high-resolution icons.
-- Registers file associations for **`.md`** and **`.markdown`** files with custom icons.
-- Adds an **"Open with RapidMD"** right-click context menu item in Windows Explorer.
+- Creates **Desktop** and **Start Menu** shortcuts with embedded high-resolution icons.
+- Registers Windows file associations (`OpenWithProgids` & `Default Programs`) for **`.md`** and **`.markdown`** files with application icons.
+- Integrates **"Open with RapidMD"** into the Windows right-click context menu.
+- Suppresses command-line console windows for a seamless, secure desktop experience.
 - Includes a clean Windows uninstaller accessible via Windows Settings / Add or Remove Programs.
 
 ---
@@ -59,7 +61,7 @@ Download the ready-to-run setup wizard:
 
 ```bash
 # Clone the repository
-git clone https://github.com/ismail/RustDownViewer.git
+git clone https://github.com/IsmailAzzouz/RapidMD.git
 cd RustDownViewer
 
 # Run in development mode

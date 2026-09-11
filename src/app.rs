@@ -117,6 +117,7 @@ pub struct App {
     last_frame_time: Instant,
     fps: f32,
     icon_texture: Option<egui::TextureHandle>,
+    cjk_loaded: bool,
 }
 
 fn menu_separator(ui: &mut egui::Ui, pal: &Palette) {
@@ -254,12 +255,16 @@ impl App {
             last_frame_time: Instant::now(),
             fps: 60.0,
             icon_texture: None,
+            cjk_loaded: false,
         };
         for arg in std::env::args().skip(1) {
             let p = PathBuf::from(&arg);
             if p.is_file() {
                 app.open_path(&p, true);
             }
+        }
+        if !app.cjk_loaded {
+            app.ensure_cjk_if_needed(&cc.egui_ctx);
         }
         let items = scan_recovery();
         if !items.is_empty() {
@@ -619,6 +624,34 @@ impl App {
         }
     }
 
+    pub fn ensure_cjk_if_needed(&mut self, ctx: &egui::Context) {
+        if self.cjk_loaded {
+            return;
+        }
+        let needs = self.buffers.iter().any(|b| text_has_cjk(&b.text));
+        if needs {
+            self.load_cjk_fonts(ctx);
+        }
+    }
+
+    fn load_cjk_fonts(&mut self, ctx: &egui::Context) {
+        if self.cjk_loaded {
+            return;
+        }
+        self.cjk_loaded = true;
+        if let Some(font_data) = load_cjk_font_data() {
+            let mut fonts = build_base_fonts();
+            fonts.font_data.insert("cjk".to_owned(), std::sync::Arc::new(font_data));
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                if let Some(fam) = fonts.families.get_mut(&family) {
+                    fam.push("cjk".to_owned());
+                }
+            }
+            crate::theme::register_bold_family(&mut fonts);
+            ctx.set_fonts(fonts);
+        }
+    }
+
     // ------------------------------------------------------------ actions
 
     fn apply_cmd(&mut self, c: Cmd, ctx: &egui::Context) {
@@ -765,6 +798,10 @@ impl App {
     fn update_impl(&mut self, ctx: &egui::Context) {
         self.ctx_handle = Some(ctx.clone());
         self.handle_keys(ctx);
+
+        if !self.cjk_loaded {
+            self.ensure_cjk_if_needed(ctx);
+        }
 
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame_time).as_secs_f32();
@@ -1677,10 +1714,55 @@ fn push_undo_snapshot(ctx: Option<&egui::Context>, id: Option<egui::Id>, sel: Op
     }
 }
 
-fn install_fonts(ctx: &egui::Context) {
+pub fn text_has_cjk(text: &str) -> bool {
+    // Fast path: ASCII and Latin-1 supplement (< 0xE0) contain no CJK characters.
+    if !text.as_bytes().iter().any(|&b| b >= 0xE0) {
+        return false;
+    }
+    text.chars().any(|c| {
+        matches!(c,
+            '\u{2E80}'..='\u{2FD5}'
+            | '\u{3000}'..='\u{303F}'
+            | '\u{3040}'..='\u{31FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+        )
+    })
+}
+
+fn load_cjk_font_data() -> Option<egui::FontData> {
+    for c in [
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ] {
+        if let Ok(file) = std::fs::File::open(c) {
+            if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
+                let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+                return Some(egui::FontData::from_static(&leaked[..]));
+            } else if let Ok(bytes) = std::fs::read(c) {
+                return Some(egui::FontData::from_owned(bytes));
+            }
+        }
+    }
+    None
+}
+
+fn build_base_fonts() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
 
-    // 1. Proportional: Inter (embedded for pixel-perfect, crisp antialiasing everywhere)
+    // Remove redundant Ubuntu font to save heap memory; Inter and JetBrains Mono are primary.
+    fonts.font_data.remove("Ubuntu-Light");
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(fam) = fonts.families.get_mut(&family) {
+            fam.retain(|name| name != "Ubuntu-Light");
+        }
+    }
+
+    // 1. Proportional: Inter
     fonts.font_data.insert(
         "inter_regular".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf"))),
@@ -1693,7 +1775,7 @@ fn install_fonts(ctx: &egui::Context) {
         family.insert(0, "inter_regular".to_owned());
     }
 
-    // 2. Monospace: JetBrains Mono (gold standard developer monospace)
+    // 2. Monospace: JetBrains Mono
     fonts.font_data.insert(
         "jetbrains_mono".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"))),
@@ -1702,22 +1784,12 @@ fn install_fonts(ctx: &egui::Context) {
         family.insert(0, "jetbrains_mono".to_owned());
     }
 
-    for c in [
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\simhei.ttf",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    ] {
-        if let Ok(bytes) = std::fs::read(c) {
-fonts.font_data.insert("cjk".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts.families.get_mut(&family).unwrap().push("cjk".to_owned());
-            }
-            break;
-        }
-    }
     crate::theme::register_bold_family(&mut fonts);
-    ctx.set_fonts(fonts);
+    fonts
+}
+
+fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(build_base_fonts());
 }
 
 fn recovery_dir() -> PathBuf {
@@ -2308,6 +2380,7 @@ mod tests {
             last_frame_time: Instant::now(),
             fps: 60.0,
             icon_texture: None,
+            cjk_loaded: false,
         };
         app.add_untitled();
         app
@@ -2581,5 +2654,28 @@ mod tests {
         assert!(!app.settings.show_fps);
         app.apply_cmd(Cmd::ToggleFps, &ctx);
         assert!(app.settings.show_fps);
+    }
+
+    #[test]
+    fn test_text_has_cjk_detection() {
+        assert!(!text_has_cjk("Hello world"));
+        assert!(!text_has_cjk("# RapidMD - Fast Markdown"));
+        assert!(!text_has_cjk("Bonjour, ça va être l'été"));
+        assert!(!text_has_cjk("Grüße aus Köln - Straße"));
+        assert!(text_has_cjk("你好世界"));
+        assert!(text_has_cjk("こんにちは"));
+        assert!(text_has_cjk("カタカナ"));
+        assert!(text_has_cjk("안녕하세요"));
+        assert!(text_has_cjk("「引用」"));
+    }
+
+    #[test]
+    fn test_lazy_cjk_font_trigger() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        assert!(!app.cjk_loaded);
+        app.buffers[0].text = "Hello world".to_string();
+        app.ensure_cjk_if_needed(&ctx);
+        assert!(!app.cjk_loaded);
     }
 }
