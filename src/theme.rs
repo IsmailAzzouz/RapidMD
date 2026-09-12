@@ -224,7 +224,7 @@ impl Palette {
         visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
         visuals.widgets.noninteractive.fg_stroke.color = self.text;
 
-        let mut style = (*ctx.style()).clone();
+        let mut style = (*ctx.global_style()).clone();
         style.visuals = visuals;
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
@@ -245,7 +245,7 @@ impl Palette {
             opt.round_text_to_pixels = true;
         });
 
-        ctx.set_style(style);
+        ctx.set_global_style(style);
     }
 }
 
@@ -294,8 +294,9 @@ mod tests {
         register_bold_family(&mut fonts);
         let ctx = egui::Context::default();
         ctx.set_fonts(fonts);
-        let _ = ctx.run(egui::RawInput::default(), |_| {});
-        let (bold, regular) = ctx.fonts(|f| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        let (bold, regular) = ctx.fonts_mut(|f| {
             (
                 f.layout_no_wrap("Wg".to_owned(), bold_font(14.0), Color32::WHITE).size().x,
                 f.layout_no_wrap("Wg".to_owned(), egui::FontId::proportional(14.0), Color32::WHITE).size().x,
@@ -322,7 +323,7 @@ mod tests {
     fn test_palette_apply_applies_radii_and_visuals() {
         let ctx = egui::Context::default();
         Palette::dark().apply(&ctx);
-        assert_eq!(ctx.style().visuals.window_corner_radius, egui::CornerRadius::same(10));
+        assert_eq!(ctx.global_style().visuals.window_corner_radius, egui::CornerRadius::same(10));
         Palette::light().apply(&ctx);
     }
 }

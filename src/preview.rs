@@ -221,7 +221,7 @@ fn spans_to_job(spans: &[Span], pal: &Palette, size: f32, color: Color32) -> (La
 fn label_rich(ui: &mut egui::Ui, job: &LayoutJob, links: LinkHits, pal: &Palette, cmds: &mut Vec<Cmd>) {
     let mut job = job.clone();
     job.wrap.max_width = ui.available_width().max(8.0);
-    let galley = ui.fonts(|f| f.layout_job(job));
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
     let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
     ui.painter().galley(rect.min, galley.clone(), pal.text);
     if links.is_empty() {
@@ -231,10 +231,10 @@ fn label_rich(ui: &mut egui::Ui, job: &LayoutJob, links: LinkHits, pal: &Palette
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if let Some(pos) = resp.hover_pos().filter(|p| rect.contains(*p)) {
-        let cc = galley.cursor_from_pos(pos - rect.min).ccursor;
+        let cc = galley.cursor_from_pos(pos - rect.min);
         for (range, url) in &links {
-            if range.contains(&cc.index) {
-                egui::show_tooltip_at_pointer(ui.ctx(), resp.layer_id, egui::Id::new("mdlink"), |ui| {
+            if range.contains(&cc.index.0) {
+                egui::Tooltip::always_open(ui.ctx().clone(), resp.layer_id, egui::Id::new("mdlink"), egui::PopupAnchor::Pointer).show(|ui| {
                     ui.label(egui::RichText::new(url.as_str()).color(pal.accent).monospace());
                 });
                 if resp.clicked() {
@@ -456,7 +456,7 @@ fn render_list(
             } else if ordered {
                 let text = format!("{}.", i + 1);
                 let font = FontId::monospace(base);
-                let g = ui.fonts(|f| f.layout_no_wrap(text.clone(), font, pal.faint));
+                let g = ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), font, pal.faint));
                 ui.painter().galley(Pos2::new(mrect.right() - g.size().x, mrect.center().y - g.size().y * 0.5), g, pal.faint);
             } else {
                 ui.painter().circle_filled(Pos2::new(mrect.left() + marker_w * 0.4, mrect.center().y), 2.8, pal.faint);
@@ -487,7 +487,7 @@ ui.label(egui::RichText::new(lang).monospace().color(pal.faint).size(base * 0.72
             ui.add_space(4.0);
         }
         egui::ScrollArea::horizontal().id_salt("codeh").auto_shrink([false, true]).show(ui, |ui| {
-            let galley = ui.fonts(|f| f.layout_job(job.clone()));
+            let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
             let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
             ui.painter().galley(rect.min, galley, pal.code_text);
         });
@@ -707,11 +707,12 @@ fn two() {}
         let ctx = egui::Context::default();
         let pal = Palette::dark();
         let mut images = ImageCache::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let _ = render(ui, &doc, &pal, None, &mut images);
             });
         });
+        out.textures_delta.clear();
     }
 
     #[test]
@@ -722,11 +723,12 @@ fn two() {}
         let ctx = egui::Context::default();
         let pal = Palette::dark();
         let mut images = ImageCache::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let _cmds = render(ui, &doc, &pal, None, &mut images);
                 assert!(!images.map.is_empty(), "Image must be loaded successfully!");
             });
         });
+        out.textures_delta.clear();
     }
 }

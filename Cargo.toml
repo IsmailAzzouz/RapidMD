@@ -10,7 +10,7 @@ name = "rapidmd"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.31"
+eframe = "0.36"
 pulldown-cmark = "0.12"
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }

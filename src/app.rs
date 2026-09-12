@@ -795,12 +795,13 @@ impl App {
 
     // ------------------------------------------------------------ eframe
 
-    fn update_impl(&mut self, ctx: &egui::Context) {
+    fn update_impl(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        let ctx = ui.ctx().clone();
         self.ctx_handle = Some(ctx.clone());
-        self.handle_keys(ctx);
+        self.handle_keys(&ctx);
 
         if !self.cjk_loaded {
-            self.ensure_cjk_if_needed(ctx);
+            self.ensure_cjk_if_needed(&ctx);
         }
 
         let now = Instant::now();
@@ -843,7 +844,20 @@ impl App {
             }
         }
 
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|d| d.path.clone()).collect());
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|d| {
+                    let p = d.path();
+                    if p.as_os_str().is_empty() {
+                        None
+                    } else {
+                        Some(p.to_path_buf())
+                    }
+                })
+                .collect()
+        });
         for p in dropped {
             self.open_path(&p, true);
         }
@@ -853,23 +867,23 @@ impl App {
         let modal = self.modal.take();
 
         let panel_frame = egui::Frame::new().fill(self.palette.panel_bg).stroke(egui::Stroke::new(1.0, self.palette.hr));
-        egui::TopBottomPanel::top("menu").frame(panel_frame).exact_height(26.0).show(ctx, |ui| {
+        egui::Panel::top("menu").frame(panel_frame).exact_size(26.0).show(ui, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| self.menu_row(ui));
         });
-        egui::TopBottomPanel::top("tool").frame(panel_frame).exact_height(32.0).show(ctx, |ui| {
+        egui::Panel::top("tool").frame(panel_frame).exact_size(32.0).show(ui, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| self.tool_row(ui));
         });
         if self.buffers.len() > 1 {
-            egui::TopBottomPanel::top("tabs").frame(panel_frame).exact_height(24.0).show(ctx, |ui| {
+            egui::Panel::top("tabs").frame(panel_frame).exact_size(24.0).show(ui, |ui| {
                 ui.add_enabled_ui(modal.is_none(), |ui| self.tab_row(ui));
             });
         }
         if self.find.open && self.active.is_some() {
-            egui::TopBottomPanel::top("find").frame(panel_frame).exact_height(28.0).show(ctx, |ui| {
+            egui::Panel::top("find").frame(panel_frame).exact_size(28.0).show(ui, |ui| {
                 ui.add_enabled_ui(modal.is_none(), |ui| self.find_row(ui));
             });
         }
-        egui::TopBottomPanel::bottom("status").frame(panel_frame).exact_height(22.0).show(ctx, |ui| {
+        egui::Panel::bottom("status").frame(panel_frame).exact_size(22.0).show(ui, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| self.status_row(ui));
         });
 
@@ -881,20 +895,20 @@ impl App {
                 top: 8,
                 bottom: 4,
             });
-        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
+        let central_resp = egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| {
                 if let Some(i) = self.active {
                     match self.mode {
                         Mode::View => self.view_pane(ui, i),
                         Mode::Edit => self.edit_pane(ui, i),
                         Mode::Split => {
-                            egui::SidePanel::left("split")
+                            egui::Panel::left("split")
                                 .resizable(true)
-                                .min_width(120.0)
-                                .max_width((ui.available_width() - 120.0).max(120.0))
-                                .default_width(ui.available_width() * 0.5)
+                                .min_size(120.0)
+                                .max_size((ui.available_width() - 120.0).max(120.0))
+                                .default_size(ui.available_width() * 0.5)
                                 .frame(egui::Frame::new().fill(self.palette.window_bg).stroke(egui::Stroke::new(1.0, self.palette.hr)))
-                                .show_inside(ui, |ui| self.edit_pane(ui, i));
+                                .show(ui, |ui| self.edit_pane(ui, i));
                             self.view_pane(ui, i);
                         }
                     }
@@ -904,14 +918,15 @@ impl App {
             });
         });
 
-        self.toast_ui(ctx);
+        self.toast_ui(&ctx);
         if let Some(m) = modal {
-            let screen_rect = ctx.screen_rect();
+            let screen_rect = ctx.viewport_rect();
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("modal_backdrop")));
             painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(100));
-            self.modal_ui(ctx, m);
+            self.modal_ui(&ctx, m);
         }
-        self.flush(ctx);
+        self.flush(&ctx);
+        central_resp.response.rect
     }
 
     fn flush(&mut self, ctx: &egui::Context) {
@@ -977,16 +992,16 @@ impl App {
             visuals.selection.stroke = egui::Stroke::NONE;
             visuals.selection.bg_fill = visuals.widgets.hovered.bg_fill;
 
-            egui::menu::bar(ui, |ui| {
+            egui::menu::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button(RichText::new("File").size(13.0).color(pal.text), |ui| {
                     ui.set_min_width(200.0);
                     if menu_item(ui, "New Document", "Ctrl+N", None, &pal).clicked() {
                         self.pending.push(Cmd::New);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Open…", "Ctrl+O", None, &pal).clicked() {
                         self.pending.push(Cmd::Open);
-                        ui.close_menu();
+                        ui.close();
                     }
                     menu_separator(ui, &pal);
                     let recents = self.settings.recent_paths();
@@ -997,7 +1012,7 @@ impl App {
                                 let name = r.file_name().and_then(|n| n.to_str()).unwrap_or("document");
                                 if menu_item(ui, name, "", None, &pal).on_hover_text(r.display().to_string()).clicked() {
                                     self.pending.push(Cmd::OpenRecent(r));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             }
                         });
@@ -1005,20 +1020,20 @@ impl App {
                     }
                     if menu_item(ui, "Save", "Ctrl+S", None, &pal).clicked() {
                         self.pending.push(Cmd::Save);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Save As…", "Ctrl+Shift+S", None, &pal).clicked() {
                         self.pending.push(Cmd::SaveAs);
-                        ui.close_menu();
+                        ui.close();
                     }
                     menu_separator(ui, &pal);
                     if menu_item(ui, "Close Tab", "Ctrl+W", None, &pal).clicked() {
                         self.pending.push(Cmd::CloseTab);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Quit", "Ctrl+Shift+W", None, &pal).clicked() {
                         self.pending.push(Cmd::Quit);
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -1026,11 +1041,11 @@ impl App {
                     ui.set_min_width(180.0);
                     if menu_item(ui, "Find / Replace", "Ctrl+F", None, &pal).clicked() {
                         self.pending.push(Cmd::FindBar);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Go to Line…", "Ctrl+G", None, &pal).clicked() {
                         self.pending.push(Cmd::GoToLine);
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -1038,15 +1053,15 @@ impl App {
                     ui.set_min_width(220.0);
                     if menu_item(ui, "View", "Ctrl+1", Some(self.mode == Mode::View), &pal).clicked() {
                         self.pending.push(Cmd::Mode(Mode::View));
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Edit", "Ctrl+2", Some(self.mode == Mode::Edit), &pal).clicked() {
                         self.pending.push(Cmd::Mode(Mode::Edit));
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Split", "Ctrl+3", Some(self.mode == Mode::Split), &pal).clicked() {
                         self.pending.push(Cmd::Mode(Mode::Split));
-                        ui.close_menu();
+                        ui.close();
                     }
                     menu_separator(ui, &pal);
                     ui.menu_button("Theme", |ui| {
@@ -1054,39 +1069,39 @@ impl App {
                         for t in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::System] {
                             if menu_item(ui, t.label(), "", Some(self.settings.theme == t), &pal).clicked() {
                                 self.pending.push(Cmd::Theme(t));
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     });
                     menu_separator(ui, &pal);
                     if menu_toggle(ui, "Wrap editor text", self.settings.wrap_editor, &pal).clicked() {
                         self.pending.push(Cmd::Wrap);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_toggle(ui, "Line numbers", self.settings.show_line_numbers, &pal).clicked() {
                         self.pending.push(Cmd::Numbers);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_toggle(ui, "Sync scroll in split view", self.settings.sync_scroll, &pal).clicked() {
                         self.pending.push(Cmd::SyncScroll);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_toggle(ui, "Show FPS counter", self.settings.show_fps, &pal).clicked() {
                         self.pending.push(Cmd::ToggleFps);
-                        ui.close_menu();
+                        ui.close();
                     }
                     menu_separator(ui, &pal);
                     if menu_item(ui, "Zoom In", "Ctrl+=", None, &pal).clicked() {
                         self.pending.push(Cmd::ZoomIn);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Zoom Out", "Ctrl+-", None, &pal).clicked() {
                         self.pending.push(Cmd::ZoomOut);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Reset zoom", "Ctrl+0", None, &pal).clicked() {
                         self.pending.push(Cmd::ZoomReset);
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -1609,7 +1624,8 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                             .margin(Margin::symmetric(12, 6));
                         let use_syntax = len < MAX_SYNTAX_CHARS;
                         let m2 = matches.clone();
-                        let mut layouter = move |ui: &egui::Ui, text: &str, width: f32| {
+                        let mut layouter = move |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, width: f32| {
+                            let text = buffer.as_str();
                             let max_w = if wrap { width.min(avail_w).max(80.0) } else { f32::INFINITY };
                             let mut job = if use_syntax {
                                 editor::editor_job(text, &pal, font.clone(), &m2)
@@ -1618,14 +1634,14 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                             };
                             job.wrap.max_width = max_w;
                             job.wrap.break_anywhere = true;
-                            ui.fonts(|f| f.layout_job(job))
+                            ui.fonts_mut(|f| f.layout_job(job))
                         };
                         te = te.layouter(&mut layouter);
                         let out = te.show(ui);
                         self.editor_widget = Some(out.response.id);
                         if let Some(pc) = self.pending_cursor.take() {
-                            let s = pc.sorted();
-                            self.sel = Some((s[0].index, s[1].index));
+                            let s = pc.sorted_cursors();
+                            self.sel = Some((s[0].index.0, s[1].index.0));
                             if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), out.response.id) {
                                 st.cursor.set_char_range(Some(pc));
                                 st.store(ui.ctx(), out.response.id);
@@ -1637,7 +1653,7 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                             self.focus_editor = false;
                         } else if let Some(r) = out.cursor_range {
                             let s = r.sorted_cursors();
-                            self.sel = Some((s[0].ccursor.index, s[1].ccursor.index));
+                            self.sel = Some((s[0].index.0, s[1].index.0));
                         }
                         if out.response.changed() {
                             self.invalidate_preview();
@@ -1685,10 +1701,10 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
     }
 }
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.update_impl(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.update_impl(ui);
     }
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.settings.save();
         clear_recovery();
     }
@@ -2386,6 +2402,15 @@ mod tests {
         app
     }
 
+    fn step<R>(ctx: &egui::Context, raw_input: egui::RawInput, mut run_ui: impl FnMut(&mut egui::Ui) -> R) -> R {
+        let mut res = None;
+        let mut out = ctx.run_ui(raw_input, |ui| {
+            res = Some(run_ui(ui));
+        });
+        out.textures_delta.clear();
+        res.unwrap()
+    }
+
     #[test]
     fn test_app_smart_enter_bullet_flow() {
         let ctx = egui::Context::default();
@@ -2394,10 +2419,10 @@ mod tests {
         app.sel = Some((7, 7));
 
         // Frame 1: render editor, request focus
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
             if let Some(id) = app.editor_widget {
-                ctx.memory_mut(|m| m.request_focus(id));
+                ui.ctx().memory_mut(|m| m.request_focus(id));
             }
         });
 
@@ -2410,8 +2435,8 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(raw_enter, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw_enter, |ui| {
+            app.update_impl(ui);
         });
         assert_eq!(app.buffers[0].text, "- first\n- ");
 
@@ -2424,8 +2449,8 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(raw_enter2, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw_enter2, |ui| {
+            app.update_impl(ui);
         });
         // Empty bullet is removed!
         assert_eq!(app.buffers[0].text, "- first\n");
@@ -2439,10 +2464,10 @@ mod tests {
         app.sel = Some((8, 8));
 
         // Frame 1: render editor, request focus
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
             if let Some(id) = app.editor_widget {
-                ctx.memory_mut(|m| m.request_focus(id));
+                ui.ctx().memory_mut(|m| m.request_focus(id));
             }
         });
 
@@ -2455,8 +2480,8 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(raw_enter, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw_enter, |ui| {
+            app.update_impl(ui);
         });
         assert_eq!(app.buffers[0].text, "1. first\n2. ");
 
@@ -2469,8 +2494,8 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(raw_enter2, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw_enter2, |ui| {
+            app.update_impl(ui);
         });
         assert_eq!(app.buffers[0].text, "1. first\n");
     }
@@ -2482,8 +2507,8 @@ mod tests {
         app.buffers[0].text = "section title".to_string();
         app.sel = Some((0, 0));
         app.pending.push(Cmd::Heading(3));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
         assert_eq!(app.buffers[0].text, "### section title");
     }
@@ -2499,29 +2524,29 @@ mod tests {
 
         // 1. Insert row above
         app.pending.push(Cmd::TableOp(TableCmd::InsertRowAbove));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
         assert!(app.buffers[0].text.lines().count() >= 6);
 
         // 2. Insert row below
         app.pending.push(Cmd::TableOp(TableCmd::InsertRowBelow));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
         assert!(app.buffers[0].text.lines().count() >= 7);
 
         // 3. Insert column left
         app.pending.push(Cmd::TableOp(TableCmd::InsertColLeft));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
 
         // 4. Insert column right
         app.pending.push(Cmd::TableOp(TableCmd::InsertColRight));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
 
         // 5. Delete row
         app.pending.push(Cmd::TableOp(TableCmd::DeleteRow));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
 
         // 6. Delete column
         app.pending.push(Cmd::TableOp(TableCmd::DeleteCol));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
     }
 
     #[test]
@@ -2531,8 +2556,8 @@ mod tests {
         app.modal = Some(Modal::TablePicker { idx: 0 });
 
         // Frame renders with modal active: editor_widget and panels should still be created
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
 
         assert!(app.modal.is_some(), "modal remains open");
@@ -2546,12 +2571,11 @@ mod tests {
         raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0)));
         let mut app = create_test_app(&ctx);
         app.add_untitled();
-        let _ = ctx.run(raw.clone(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw.clone(), |ui| {
+            app.update_impl(ui);
         });
-        let _ = ctx.run(raw, |ctx| {
-            app.update_impl(ctx);
-            let avail = ctx.available_rect();
+        step(&ctx, raw, |ui| {
+            let avail = app.update_impl(ui);
             assert!(avail.min.y <= 90.0, "tabs panel height must be compact without black gap, got min.y={}", avail.min.y);
         });
     }
@@ -2567,8 +2591,8 @@ mod tests {
         app.settings.wrap_editor = false;
         app.buffers[0].text = "This is a very long line of text that should wrap inside the split pane editor instead of extending past the split boundary and getting hidden by the preview pane on the right.".to_string();
 
-        let _ = ctx.run(raw, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw, |ui| {
+            app.update_impl(ui);
             // The editor widget should have been rendered and its ID recorded
             assert!(app.editor_widget.is_some());
         });
@@ -2582,20 +2606,20 @@ mod tests {
         app.sel = Some((0, 0));
 
         // Frame 1: render app
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
 
         // User clicks H3 on toolbar:
         app.pending.push(Cmd::Heading(3));
 
         // Frame 2: app runs flush, applies Heading(3), edit_pane renders and calls request_focus
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
         // Frame 3: edit_pane runs with focus_editor = true and requests focus
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
             let editor_id = app.editor_widget.expect("editor must have ID");
             assert!(ctx.memory(|m| m.has_focus(editor_id)), "Editor must automatically regain focus after toolbar action!");
         });
@@ -2619,14 +2643,14 @@ mod tests {
 
         // Frame 1: trigger About
         app.pending.push(Cmd::About);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
         assert!(matches!(app.modal, Some(Modal::About)));
 
         // Frame 2: modal should stay open, not disappear
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
         assert!(matches!(app.modal, Some(Modal::About)), "Modal::About must persist across frames until closed");
 
@@ -2639,8 +2663,8 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(esc_input, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, esc_input, |ui| {
+            app.update_impl(ui);
         });
         assert!(app.modal.is_none(), "Escape must dismiss the help modal");
     }
