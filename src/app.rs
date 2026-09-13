@@ -1885,12 +1885,12 @@ impl App {
                                         .show(ui, |ui| {
                                             let tech = [
                                                 ("Rust", "Safe, concurrent native systems language (2021 edition)"),
-                                                ("eframe & egui", "0.31 immediate-mode GPU-accelerated GUI with embedded Inter font"),
-                                                ("pulldown-cmark", "0.12 pull-parser for CommonMark, GFM tables & task lists"),
+                                                ("eframe & egui", "0.36 immediate-mode GPU-accelerated GUI with embedded Inter font"),
+                                                ("pulldown-cmark", "0.13 pull-parser for CommonMark, GFM tables & task lists"),
                                                 ("syntect", "5.3 syntax highlighter using TextMate grammars"),
                                                 ("image", "0.25 pure-Rust local image decoding (PNG, JPEG, WebP, GIF)"),
                                                 ("arboard", "3.0 cross-platform native clipboard engine"),
-                                                ("rfd", "0.15 native system file/folder dialogs"),
+                                                ("rfd", "0.17 native system file/folder dialogs"),
                                             ];
                                             for (k, desc) in tech {
                                                 ui.label(RichText::new(k).strong().color(self.palette.text).size(12.0));

@@ -17,7 +17,7 @@ impl Default for ThemeMode {
 
 /// Whether the OS currently reports a dark color scheme.
 pub fn os_is_dark() -> bool {
-    matches!(dark_light::detect(), dark_light::Mode::Dark)
+    matches!(dark_light::detect(), Ok(dark_light::Mode::Dark))
 }
 
 impl ThemeMode {

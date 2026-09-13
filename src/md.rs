@@ -305,6 +305,8 @@ fn own_event(ev: Event<'_>) -> Event<'static> {
                 id: own(id),
             },
             Tag::MetadataBlock(k) => Tag::MetadataBlock(k),
+            Tag::Superscript => Tag::Superscript,
+            Tag::Subscript => Tag::Subscript,
         }),
         Event::End(te) => Event::End(te),
         Event::Text(t) => Event::Text(own(t)),

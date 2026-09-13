@@ -234,7 +234,7 @@ fn label_rich(ui: &mut egui::Ui, job: &LayoutJob, links: LinkHits, pal: &Palette
         let cc = galley.cursor_from_pos(pos - rect.min);
         for (range, url) in &links {
             if range.contains(&cc.index.0) {
-                egui::Tooltip::always_open(ui.ctx().clone(), resp.layer_id, egui::Id::new("mdlink"), egui::PopupAnchor::Pointer).show(|ui| {
+                egui::Tooltip::always_open(ui.ctx().clone(), resp.layer_id, resp.id.with("mdlink"), egui::PopupAnchor::Pointer).show(|ui| {
                     ui.label(egui::RichText::new(url.as_str()).color(pal.accent).monospace());
                 });
                 if resp.clicked() {
@@ -255,7 +255,7 @@ pub fn render(ui: &mut egui::Ui, doc: &Doc, pal: &Palette, base_dir: Option<&Pat
     let mut cmds = Vec::new();
     let base = base_font_size(ui);
     for (i, block) in doc.blocks.iter().enumerate() {
-        ui.push_id(i, |ui| {
+        ui.push_id(("doc_block", i), |ui| {
             render_block(ui, block, pal, base, base_dir, images, &mut cmds);
         });
     }
@@ -265,14 +265,14 @@ pub fn render(ui: &mut egui::Ui, doc: &Doc, pal: &Palette, base_dir: Option<&Pat
         ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0, pal.hr));
         ui.add_space(8.0);
         for (label, blocks) in &doc.footnotes {
-            ui.push_id(label, |ui| {
+            ui.push_id(("footnote", label), |ui| {
                 ui.label(
                     egui::RichText::new(format!("[{}] ", label))
                         .color(pal.accent)
                         .size(base * 0.78),
                 );
                 for (bi, b) in blocks.iter().enumerate() {
-                    ui.push_id(bi, |ui| {
+                    ui.push_id(("fn_block", bi), |ui| {
                         render_block(ui, b, pal, base * 0.92, base_dir, images, &mut cmds);
                     });
                 }
@@ -367,8 +367,10 @@ fn render_block(
         }
         Block::Center(items) => {
             ui.vertical_centered(|ui| {
-                for it in items {
-                    render_block(ui, it, pal, base, base_dir, images, cmds);
+                for (i, it) in items.iter().enumerate() {
+                    ui.push_id(("center_block", i), |ui| {
+                        render_block(ui, it, pal, base, base_dir, images, cmds);
+                    });
                 }
             });
         }
@@ -415,7 +417,7 @@ ui.label(egui::RichText::new(label).strong().color(accent).size(base * 0.78));
             ui.vertical(|ui| {
                 ui.set_max_width(ui.available_width() - 8.0);
                 for (i, b) in items.iter().enumerate() {
-                    ui.push_id(i, |ui| {
+                    ui.push_id(("quote_block", i), |ui| {
                         render_block(ui, b, pal, base, base_dir, images, cmds);
                     });
                 }
@@ -438,36 +440,38 @@ fn render_list(
     let row_h = ui.text_style_height(&egui::TextStyle::Body);
     let marker_w = if ordered { 26.0 + (depth.clamp(0, 4)) as f32 * 4.0 } else { 20.0 };
     for (i, item) in items.iter().enumerate() {
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let (mrect, _) = ui.allocate_exact_size(Vec2::new(marker_w, row_h), Sense::hover());
-            if let Some(checked) = item.checked {
-                let c = mrect.center();
-                let s = (row_h * 0.52).max(12.0);
-                let r = Rect::from_center_size(c, Vec2::splat(s));
-                if checked {
-                    let fill_col = if pal.dark { Color32::WHITE } else { Color32::BLACK };
-                    let tick_col = if pal.dark { Color32::BLACK } else { Color32::WHITE };
-                    ui.painter().rect_filled(r, 3.5, fill_col);
-                    ui.painter().text(c, egui::Align2::CENTER_CENTER, "✓", FontId::proportional(base * 0.76), tick_col);
+        ui.push_id(("list_item", i), |ui| {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (mrect, _) = ui.allocate_exact_size(Vec2::new(marker_w, row_h), Sense::hover());
+                if let Some(checked) = item.checked {
+                    let c = mrect.center();
+                    let s = (row_h * 0.52).max(12.0);
+                    let r = Rect::from_center_size(c, Vec2::splat(s));
+                    if checked {
+                        let fill_col = if pal.dark { Color32::WHITE } else { Color32::BLACK };
+                        let tick_col = if pal.dark { Color32::BLACK } else { Color32::WHITE };
+                        ui.painter().rect_filled(r, 3.5, fill_col);
+                        ui.painter().text(c, egui::Align2::CENTER_CENTER, "✓", FontId::proportional(base * 0.76), tick_col);
+                    } else {
+                        ui.painter().rect_stroke(r, 3.5, Stroke::new(1.2, pal.faint), egui::StrokeKind::Inside);
+                    }
+                } else if ordered {
+                    let text = format!("{}.", i + 1);
+                    let font = FontId::monospace(base);
+                    let g = ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), font, pal.faint));
+                    ui.painter().galley(Pos2::new(mrect.right() - g.size().x, mrect.center().y - g.size().y * 0.5), g, pal.faint);
                 } else {
-                    ui.painter().rect_stroke(r, 3.5, Stroke::new(1.2, pal.faint), egui::StrokeKind::Inside);
+                    ui.painter().circle_filled(Pos2::new(mrect.left() + marker_w * 0.4, mrect.center().y), 2.8, pal.faint);
                 }
-            } else if ordered {
-                let text = format!("{}.", i + 1);
-                let font = FontId::monospace(base);
-                let g = ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), font, pal.faint));
-                ui.painter().galley(Pos2::new(mrect.right() - g.size().x, mrect.center().y - g.size().y * 0.5), g, pal.faint);
-            } else {
-                ui.painter().circle_filled(Pos2::new(mrect.left() + marker_w * 0.4, mrect.center().y), 2.8, pal.faint);
-            }
-            ui.vertical(|ui| {
-                ui.set_max_width((ui.available_width() - marker_w).max(80.0));
-                for (bi, b) in item.blocks.iter().enumerate() {
-                    ui.push_id(bi, |ui| {
-                        render_block(ui, b, pal, base, base_dir, images, cmds);
-                    });
-                }
+                ui.vertical(|ui| {
+                    ui.set_max_width((ui.available_width() - marker_w).max(80.0));
+                    for (bi, b) in item.blocks.iter().enumerate() {
+                        ui.push_id(("item_block", bi), |ui| {
+                            render_block(ui, b, pal, base, base_dir, images, cmds);
+                        });
+                    }
+                });
             });
         });
     }
@@ -702,6 +706,21 @@ fn two() {}
 | Col A | Col B |
 | --- | --- |
 | A | B |
+
+* Step 1: Clone repository
+  ```bash
+  git clone https://github.com/IsmailAzzouz/axis-computer-use.git
+  cd axis-computer-use
+  ```
+* Step 2: Install editable mode
+  ```bash
+  pip install -e .
+  ```
+
+> Blockquote with code:
+> ```bash
+> echo "test"
+> ```
 "#;
         let doc = crate::md::parse(md);
         let ctx = egui::Context::default();
@@ -713,6 +732,19 @@ fn two() {}
             });
         });
         out.textures_delta.clear();
+
+        fn check_shape(s: &egui::epaint::Shape) -> bool {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    let txt = t.galley.text();
+                    txt.contains("ID clashes") || txt.contains("First use of")
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().any(check_shape),
+                _ => false,
+            }
+        }
+        let clashed = out.shapes.iter().any(|cs| check_shape(&cs.shape));
+        assert!(!clashed, "egui reported an ID clash warning in rendered shapes!");
     }
 
     #[test]
