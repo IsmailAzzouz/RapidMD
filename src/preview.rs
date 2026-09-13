@@ -23,6 +23,7 @@ pub enum Cmd {
     OpenUrl(String),
     OpenFile(PathBuf),
     Reveal(PathBuf),
+    Toast(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -113,12 +114,7 @@ fn code_job(code: &str, lang: &str, pal: &Palette, font_size: f32) -> LayoutJob 
     };
     let theme = syntect_theme(pal.dark);
     let mut hl = HighlightLines::new(syntax, theme);
-    let mut first = true;
-    for line in code.split('\n') {
-        if !first {
-            job.append("\n", 0.0, TextFormat { font_id: mono.clone(), color: pal.faint, ..Default::default() });
-        }
-        first = false;
+    for line in syntect::util::LinesWithEndings::from(code) {
         if let Ok(ranges) = hl.highlight_line(line, syntaxes) {
             for (style, text) in ranges {
                 let mut c = style_from_syn(style.foreground);
@@ -147,7 +143,7 @@ fn append_run(job: &mut LayoutJob, chars: &mut usize, text: &str, style: crate::
         font_id: FontId::proportional(size),
         color,
         background: Color32::TRANSPARENT,
-        italics: style.italic,
+        italics: false,
         underline: Stroke::NONE,
         strikethrough: Stroke::NONE,
         ..Default::default()
@@ -156,10 +152,15 @@ fn append_run(job: &mut LayoutJob, chars: &mut usize, text: &str, style: crate::
         fmt.font_id = FontId::monospace(size);
         fmt.color = pal.code_text;
         fmt.background = pal.code_bg;
+        fmt.italics = style.italic;
+    } else if style.bold && style.italic {
+        fmt.font_id = crate::theme::bold_italic_font(size);
+        fmt.color = if pal.dark { color.linear_multiply(1.08) } else { color };
     } else if style.bold {
-        // egui has no font weight: point strong runs at a real bold family.
         fmt.font_id = crate::theme::bold_font(size);
-        fmt.color = color.linear_multiply(1.08);
+        fmt.color = if pal.dark { color.linear_multiply(1.08) } else { color };
+    } else if style.italic {
+        fmt.font_id = crate::theme::italic_font(size);
     }
     if style.strike {
         fmt.strikethrough = Stroke::new(1.0, fmt.color);
@@ -217,28 +218,32 @@ fn spans_to_job(spans: &[Span], pal: &Palette, size: f32, color: Color32) -> (La
     (job, links)
 }
 
-/// Render a text run, keeping links clickable.
+/// Render a text run with native text selection and clickable links.
 fn label_rich(ui: &mut egui::Ui, job: &LayoutJob, links: LinkHits, pal: &Palette, cmds: &mut Vec<Cmd>) {
     let mut job = job.clone();
     job.wrap.max_width = ui.available_width().max(8.0);
-    let galley = ui.fonts_mut(|f| f.layout_job(job));
-    let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
-    ui.painter().galley(rect.min, galley.clone(), pal.text);
+    let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
+    let resp = ui.add(egui::Label::new(job).selectable(true));
     if links.is_empty() {
         return;
     }
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    if let Some(pos) = resp.hover_pos().filter(|p| rect.contains(*p)) {
-        let cc = galley.cursor_from_pos(pos - rect.min);
+    if let Some(pos) = resp.hover_pos().filter(|p| resp.rect.contains(*p)) {
+        let cc = galley.cursor_from_pos(pos - resp.rect.min);
         for (range, url) in &links {
             if range.contains(&cc.index.0) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 egui::Tooltip::always_open(ui.ctx().clone(), resp.layer_id, resp.id.with("mdlink"), egui::PopupAnchor::Pointer).show(|ui| {
                     ui.label(egui::RichText::new(url.as_str()).color(pal.accent).monospace());
                 });
                 if resp.clicked() {
                     cmds.push(Cmd::OpenUrl(url.clone()));
+                }
+                if resp.secondary_clicked() {
+                    ui.ctx().copy_text(url.clone());
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(url);
+                    }
+                    cmds.push(Cmd::Toast(format!("Copied link URL: {}", url)));
                 }
                 break;
             }
@@ -284,7 +289,7 @@ pub fn render(ui: &mut egui::Ui, doc: &Doc, pal: &Palette, base_dir: Option<&Pat
 }
 
 pub fn base_font_size(ui: &egui::Ui) -> f32 {
-    ui.style().text_styles.get(&egui::TextStyle::Body).map(|f| f.size).unwrap_or(14.0)
+    ui.style().text_styles.get(&egui::TextStyle::Body).map(|f| f.size).unwrap_or(15.0)
 }
 
 /// Does this span list contain a top-level image?
@@ -311,11 +316,16 @@ fn render_block(
             };
             ui.add_space(if *level <= 2 { 12.0 } else { 6.0 });
             let color = if *level == 1 { pal.text } else { pal.md_heading };
-            let (job, links) = spans_to_job(spans, pal, size, color);
+            let (mut job, links) = spans_to_job(spans, pal, size, color);
+            for sec in &mut job.sections {
+                if sec.format.font_id.family == egui::FontFamily::Proportional {
+                    sec.format.font_id = crate::theme::semibold_font(size);
+                }
+            }
             label_rich(ui, &job, links, pal, cmds);
             if *level <= 2 {
                 ui.add_space(3.0);
-                ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0, pal.hr));
+                ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top().round(), Stroke::new(1.0, pal.hr));
                 ui.add_space(3.0);
             }
         }
@@ -351,7 +361,7 @@ fn render_block(
             render_list(ui, *ordered, items, pal, base, 0, base_dir, images, cmds);
         }
         Block::CodeBlock { lang, code } => {
-            render_code(ui, code, lang, pal, base);
+            render_code(ui, code, lang, pal, base, cmds);
         }
         Block::Table(table) => {
             render_table(ui, table, pal, base, cmds);
@@ -411,17 +421,24 @@ ui.label(egui::RichText::new(label).strong().color(accent).size(base * 0.78));
             ui.add_space(2.0);
         }
         ui.horizontal(|ui| {
-            let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(3.0, 1.0), Sense::hover());
-            ui.painter().rect_filled(bar_rect, 1.5, pal.quote_bar);
-            ui.add_space(6.0);
-            ui.vertical(|ui| {
-                ui.set_max_width(ui.available_width() - 8.0);
+            let bar_w = 3.0;
+            let spacing = 8.0;
+            let bar_pos_x = ui.cursor().min.x;
+            ui.add_space(bar_w + spacing);
+            let inner_resp = ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - 4.0).max(80.0));
                 for (i, b) in items.iter().enumerate() {
                     ui.push_id(("quote_block", i), |ui| {
                         render_block(ui, b, pal, base, base_dir, images, cmds);
                     });
                 }
             });
+            let cr = inner_resp.response.rect;
+            let bar_rect = Rect::from_min_max(
+                Pos2::new(bar_pos_x.round(), cr.min.y.round() + 1.0),
+                Pos2::new((bar_pos_x + bar_w).round(), cr.max.y.round() - 1.0),
+            );
+            ui.painter().rect_filled(bar_rect, 1.5, pal.quote_bar);
         });
     });
 }
@@ -477,7 +494,7 @@ fn render_list(
     }
 }
 
-fn render_code(ui: &mut egui::Ui, code: &str, lang: &str, pal: &Palette, base: f32) {
+fn render_code(ui: &mut egui::Ui, code: &str, lang: &str, pal: &Palette, base: f32, cmds: &mut Vec<Cmd>) {
     let font_size = base * 0.92;
     let job = code_job(code, lang, pal, font_size);
     let frame = Frame::new()
@@ -486,14 +503,49 @@ fn render_code(ui: &mut egui::Ui, code: &str, lang: &str, pal: &Palette, base: f
         .stroke(egui::Stroke::new(1.0, pal.hr))
         .inner_margin(Margin::symmetric(14, 10));
     frame.show(ui, |ui| {
-        if !lang.is_empty() {
-ui.label(egui::RichText::new(lang).monospace().color(pal.faint).size(base * 0.72));
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            // Header: language badge on left, 1-click Copy button on right
+            let copy_id = ui.id().with("code_copy_ts");
+            let current_time = ui.input(|i| i.time);
+            let last_copied: Option<f64> = ui.ctx().data(|d| d.get_temp(copy_id));
+            let is_copied = last_copied.map(|t| (current_time - t) < 2.0).unwrap_or(false);
+            let btn_text = if is_copied { "Copied!" } else { "Copy" };
+
+            ui.horizontal(|ui| {
+                if !lang.is_empty() {
+                    ui.label(egui::RichText::new(lang).monospace().color(pal.faint).size(base * 0.72));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let btn = egui::Button::new(
+                        egui::RichText::new(btn_text)
+                            .size(base * 0.70)
+                            .color(if is_copied { pal.success } else { pal.faint }),
+                    )
+                    .fill(pal.widget_bg)
+                    .stroke(Stroke::new(1.0, pal.hr))
+                    .corner_radius(4.0);
+
+                    if ui.add(btn).clicked() {
+                        ui.ctx().copy_text(code.to_string());
+                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                            let _ = cb.set_text(code);
+                        }
+                        ui.ctx().data_mut(|d| d.insert_temp(copy_id, current_time));
+                        let lines = code.lines().count();
+                        let msg = if lines <= 1 {
+                            "Copied code to clipboard".to_string()
+                        } else {
+                            format!("Copied code block ({} lines) to clipboard", lines)
+                        };
+                        cmds.push(Cmd::Toast(msg));
+                    }
+                });
+            });
             ui.add_space(4.0);
-        }
-        egui::ScrollArea::horizontal().id_salt("codeh").auto_shrink([false, true]).show(ui, |ui| {
-            let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
-            let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
-            ui.painter().galley(rect.min, galley, pal.code_text);
+
+            egui::ScrollArea::horizontal().id_salt("codeh").auto_shrink([false, true]).show(ui, |ui| {
+                ui.add(egui::Label::new(job).selectable(true));
+            });
         });
     });
 }
@@ -505,13 +557,13 @@ fn render_table(ui: &mut egui::Ui, table: &Table, pal: &Palette, base: f32, _cmd
         grid.show(ui, |ui| {
             for cell in &table.header {
                 let (job, _links) = spans_to_job(cell, pal, base, pal.md_heading);
-                ui.add(egui::Label::new(job));
+                ui.add(egui::Label::new(job).selectable(true));
             }
             ui.end_row();
             for row in &table.rows {
                 for cell in row {
                     let (job, _links) = spans_to_job(cell, pal, base, pal.text);
-                    ui.add(egui::Label::new(job));
+                    ui.add(egui::Label::new(job).selectable(true));
                 }
                 ui.end_row();
             }
@@ -682,9 +734,11 @@ Span::Code { text: "x".to_owned(), style: Style { bold: true, code: true, ..Styl
             egui::FontFamily::Name(crate::theme::BOLD_FAMILY.into()),
             "**strong** must render in the bold family"
         );
-        assert_eq!(job.sections[1].format.font_id.family, egui::FontFamily::Proportional);
-        assert!(job.sections[2].format.italics, "emphasis must stay italic");
-        assert_eq!(job.sections[2].format.font_id.family, egui::FontFamily::Proportional);
+        assert_eq!(
+            job.sections[2].format.font_id.family,
+            egui::FontFamily::Name(crate::theme::ITALIC_FAMILY.into()),
+            "emphasis must use the dedicated italic family"
+        );
         assert_eq!(job.sections[3].format.font_id.family, egui::FontFamily::Monospace, "code wins over strong");
     }
 
@@ -762,5 +816,76 @@ fn two() {}
             });
         });
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn test_code_syntax_highlighting_after_comments() {
+        let code = "# comment line\nclient.focus(\"Chrome\")\nnum = 42\n";
+        let pal = Palette::dark();
+        let job = code_job(code, "python", &pal, 14.0);
+
+        // Extract section text and colors
+        let mut sections: Vec<(&str, Color32)> = Vec::new();
+        for sec in &job.sections {
+            let s = sec.byte_range.start.0;
+            let e = sec.byte_range.end.0;
+            sections.push((&job.text[s..e], sec.format.color));
+        }
+
+        // The comment color
+        let comment_sec = sections.iter().find(|(t, _)| t.contains("comment")).expect("comment section");
+        let comment_col = comment_sec.1;
+
+        // "Chrome" string should NOT have comment color
+        let chrome_sec = sections.iter().find(|(t, _)| t.contains("Chrome")).expect("chrome string");
+        assert_ne!(chrome_sec.1, comment_col, "string after comment must not have comment color");
+
+        // "42" number should NOT have comment color
+        let num_sec = sections.iter().find(|(t, _)| t.trim() == "42").expect("42 number");
+        assert_ne!(num_sec.1, comment_col, "number after comment must not have comment color");
+    }
+
+    #[test]
+    fn test_italic_and_bold_italic_use_dedicated_families() {
+        let mut job = LayoutJob::default();
+        let mut chars = 0;
+        let pal = Palette::light();
+
+        // Plain italic
+        let style_it = crate::md::Style { italic: true, ..Default::default() };
+        append_run(&mut job, &mut chars, "italic text", style_it, &pal, 15.0, pal.text);
+
+        // Bold italic
+        let style_bi = crate::md::Style { bold: true, italic: true, ..Default::default() };
+        append_run(&mut job, &mut chars, "bold italic text", style_bi, &pal, 15.0, pal.text);
+
+        assert_eq!(job.sections.len(), 2);
+
+        // First section should use ITALIC_FAMILY and NOT have synthetic shearing
+        assert_eq!(job.sections[0].format.font_id.family, egui::FontFamily::Name(crate::theme::ITALIC_FAMILY.into()));
+        assert!(!job.sections[0].format.italics, "synthetic shearing must be false when using dedicated font");
+
+        // Second section should use BOLD_ITALIC_FAMILY and NOT have synthetic shearing
+        assert_eq!(job.sections[1].format.font_id.family, egui::FontFamily::Name(crate::theme::BOLD_ITALIC_FAMILY.into()));
+        assert!(!job.sections[1].format.italics, "synthetic shearing must be false when using dedicated font");
+    }
+
+    #[test]
+    fn test_render_code_copy_button_click_and_toast() {
+        let ctx = egui::Context::default();
+        let pal = Palette::dark();
+        let mut cmds = Vec::new();
+        let code = "fn main() {\n    println!(\"Hello\");\n}\n";
+
+        // Verify render_code executes safely without any deadlock or crash across frames
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            render_code(ui, code, "rust", &pal, 15.0, &mut cmds);
+        });
+        out.textures_delta.clear();
+
+        let mut out2 = ctx.run_ui(egui::RawInput::default(), |ui| {
+            render_code(ui, code, "rust", &pal, 15.0, &mut cmds);
+        });
+        out2.textures_delta.clear();
     }
 }

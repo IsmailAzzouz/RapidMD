@@ -895,4 +895,24 @@ mod tests {
         assert!(spans.iter().any(|s| matches!(s, Span::Code { text, .. } if text == "Ctrl+S")));
         assert!(spans.iter().any(|s| matches!(s, Span::Text { style, text } if style.bold && text == "bold")));
     }
+
+    #[test]
+    fn test_p_align_center_does_not_swallow_subsequent_blocks() {
+        let md = r#"<p align="center">
+  <img src="assets/header.svg" width="100%" alt="header">
+</p>
+
+## Next Heading
+
+```python
+x = 1
+```
+"#;
+        let doc = parse(md);
+        // Blocks should be: [Center([Image]), Heading, CodeBlock]
+        assert_eq!(doc.blocks.len(), 3);
+        assert!(matches!(&doc.blocks[0], Block::Center(_)));
+        assert!(matches!(&doc.blocks[1], Block::Heading { level: 2, .. }));
+        assert!(matches!(&doc.blocks[2], Block::CodeBlock { lang, .. } if lang == "python"));
+    }
 }

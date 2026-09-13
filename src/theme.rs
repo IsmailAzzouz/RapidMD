@@ -231,11 +231,11 @@ impl Palette {
         style.spacing.window_margin = egui::Margin::same(16);
 
         let mut text_styles = std::collections::BTreeMap::new();
-        text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
-        text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-        text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.5));
-        text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(20.0));
-        text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(13.0));
+        text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+        text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
+        text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+        text_styles.insert(egui::TextStyle::Heading, semibold_font(20.0));
+        text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(13.5));
         style.text_styles = text_styles;
 
         // Antialiasing & subpixel crispness
@@ -250,30 +250,80 @@ impl Palette {
 }
 
 // ---------------------------------------------------------------------------
-// Fonts (F94) — egui ships no bold face, so `**strong**` runs are mapped to a
-// real system bold font; when none is readable the family degrades to the
-// regular stack (the preview keeps a slight color boost instead).
+// Fonts — Dedicated font faces for strong, semibold, italic, and bold-italic
+// to avoid low-quality artificial shearing or missing weights on 1x displays.
 // ---------------------------------------------------------------------------
 
-/// Font family used for strong text (registered by [`register_bold_family`]).
+/// Font family used for strong text (registered by [`register_font_families`]).
 pub const BOLD_FAMILY: &str = "rustdown-bold";
+/// Font family used for semibold/headings (registered by [`register_font_families`]).
+pub const SEMIBOLD_FAMILY: &str = "rustdown-semibold";
+/// Font family used for italic text (registered by [`register_font_families`]).
+pub const ITALIC_FAMILY: &str = "rustdown-italic";
+/// Font family used for bold-italic text (registered by [`register_font_families`]).
+pub const BOLD_ITALIC_FAMILY: &str = "rustdown-bold-italic";
 
 /// `FontId` for bold runs at `size`.
 pub fn bold_font(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name(BOLD_FAMILY.into()))
 }
 
-/// Register [`BOLD_FAMILY`] (epaint panics on unbound `FontFamily::Name`s, so
-/// this must always insert a non-empty stack — the regular fallbacks stay
-/// behind the bold face for CJK/emoji coverage).
-pub fn register_bold_family(fonts: &mut egui::FontDefinitions) {
+/// `FontId` for semibold runs (headings, buttons) at `size`.
+pub fn semibold_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(SEMIBOLD_FAMILY.into()))
+}
+
+/// `FontId` for italic runs at `size`.
+pub fn italic_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(ITALIC_FAMILY.into()))
+}
+
+/// `FontId` for bold-italic runs at `size`.
+pub fn bold_italic_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(BOLD_ITALIC_FAMILY.into()))
+}
+
+/// Register dedicated typography families into `FontDefinitions`.
+pub fn register_font_families(fonts: &mut egui::FontDefinitions) {
     fonts.font_data.insert(
         "bold".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Bold.ttf"))),
     );
-    let mut stack: Vec<String> = vec!["bold".to_owned()];
-    stack.extend(fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default());
-    fonts.families.insert(egui::FontFamily::Name(BOLD_FAMILY.into()), stack);
+    fonts.font_data.insert(
+        "semibold".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf"))),
+    );
+    fonts.font_data.insert(
+        "italic".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Italic.ttf"))),
+    );
+    fonts.font_data.insert(
+        "bold_italic".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-BoldItalic.ttf"))),
+    );
+
+    let prop_stack = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+
+    let mut bold_stack = vec!["bold".to_owned()];
+    bold_stack.extend(prop_stack.clone());
+    fonts.families.insert(egui::FontFamily::Name(BOLD_FAMILY.into()), bold_stack);
+
+    let mut semibold_stack = vec!["semibold".to_owned()];
+    semibold_stack.extend(prop_stack.clone());
+    fonts.families.insert(egui::FontFamily::Name(SEMIBOLD_FAMILY.into()), semibold_stack);
+
+    let mut italic_stack = vec!["italic".to_owned()];
+    italic_stack.extend(prop_stack.clone());
+    fonts.families.insert(egui::FontFamily::Name(ITALIC_FAMILY.into()), italic_stack);
+
+    let mut bold_italic_stack = vec!["bold_italic".to_owned()];
+    bold_italic_stack.extend(prop_stack);
+    fonts.families.insert(egui::FontFamily::Name(BOLD_ITALIC_FAMILY.into()), bold_italic_stack);
+}
+
+/// Backwards-compatible alias for [`register_font_families`].
+pub fn register_bold_family(fonts: &mut egui::FontDefinitions) {
+    register_font_families(fonts);
 }
 
 #[cfg(test)]
@@ -286,6 +336,16 @@ mod tests {
         register_bold_family(&mut fonts);
         let stack = fonts.families.get(&egui::FontFamily::Name(BOLD_FAMILY.into())).expect("bold family");
         assert!(!stack.is_empty(), "the bold family must never be empty");
+    }
+
+    #[test]
+    fn test_all_font_families_registered() {
+        let mut fonts = egui::FontDefinitions::default();
+        register_font_families(&mut fonts);
+        for fam in [BOLD_FAMILY, SEMIBOLD_FAMILY, ITALIC_FAMILY, BOLD_ITALIC_FAMILY] {
+            let stack = fonts.families.get(&egui::FontFamily::Name(fam.into())).expect(fam);
+            assert!(!stack.is_empty(), "family {} must never be empty", fam);
+        }
     }
 
     #[test]

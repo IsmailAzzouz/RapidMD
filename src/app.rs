@@ -68,9 +68,10 @@ enum Cmd {
     ToggleFps,
     GoToLine,
     About,
+    CopyMarkdown,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SplitScrollDriver {
     Editor,
     Preview,
@@ -599,6 +600,10 @@ impl App {
             push(self, Cmd::FindPrev);
         } else if kp(ctx, Key::F3) {
             push(self, Cmd::FindNext);
+        } else if cmd && shift && kp(ctx, Key::C) {
+            push(self, Cmd::CopyMarkdown);
+        } else if self.mode == Mode::View && cmd && !shift && kp(ctx, Key::C) {
+            self.toast = Some(("Copied selection to clipboard".to_string(), Instant::now()));
         } else if cmd && kp(ctx, Key::Num1) {
             push(self, Cmd::Mode(Mode::View));
         } else if cmd && kp(ctx, Key::Num2) {
@@ -688,6 +693,10 @@ impl App {
                 }
             }
             Cmd::Mode(m) => {
+                if self.mode != m {
+                    self.preview_max_scroll = 0.0;
+                    self.editor_max_scroll = 0.0;
+                }
                 self.mode = m;
                 self.invalidate_preview();
             }
@@ -773,6 +782,8 @@ impl App {
             }
             Cmd::SyncScroll => {
                 self.settings.sync_scroll = !self.settings.sync_scroll;
+                self.preview_max_scroll = 0.0;
+                self.editor_max_scroll = 0.0;
                 self.settings.save();
             }
             Cmd::ToggleFps => {
@@ -784,7 +795,34 @@ impl App {
                 self.modal = Some(Modal::GoTo { idx: self.active.unwrap_or(0) });
             }
             Cmd::About => self.modal = Some(Modal::About),
+            Cmd::CopyMarkdown => self.copy_markdown(ctx),
         }
+    }
+
+    /// Copies either the selected Markdown source or the entire document to the system clipboard.
+    /// Complexity: O(N) where N is the character length of the copied document slice.
+    fn copy_markdown(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.active else { return };
+        let text = self.buffers[idx].text.clone();
+        let (to_copy, msg) = if (self.mode == Mode::Edit || self.mode == Mode::Split) && self.sel.is_some() {
+            let sel = self.sel_bytes();
+            if !sel.is_empty() && sel.end <= text.len() {
+                let slice = text[sel].to_string();
+                let len = slice.chars().count();
+                (slice, format!("Copied Markdown selection ({} chars)", len))
+            } else {
+                let len = text.chars().count();
+                (text, format!("Copied full Markdown document ({} chars)", len))
+            }
+        } else {
+            let len = text.chars().count();
+            (text, format!("Copied full Markdown document ({} chars)", len))
+        };
+        ctx.copy_text(to_copy.clone());
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(to_copy);
+        }
+        self.toast = Some((msg, Instant::now()));
     }
 
     fn zoom(&mut self, factor: f32, ctx: &egui::Context) {
@@ -1039,6 +1077,11 @@ impl App {
 
                 ui.menu_button(RichText::new("Edit").size(13.0).color(pal.text), |ui| {
                     ui.set_min_width(180.0);
+                    if menu_item(ui, "Copy as Markdown", "Ctrl+Shift+C", None, &pal).clicked() {
+                        self.pending.push(Cmd::CopyMarkdown);
+                        ui.close();
+                    }
+                    menu_separator(ui, &pal);
                     if menu_item(ui, "Find / Replace", "Ctrl+F", None, &pal).clicked() {
                         self.pending.push(Cmd::FindBar);
                         ui.close();
@@ -1268,6 +1311,8 @@ impl App {
                                     let text_color = if is_active { self.palette.text } else { self.palette.faint };
                                     if ui.add(egui::Label::new(RichText::new(name).color(text_color).strong().size(12.0)).sense(Sense::click())).clicked() {
                                         self.active = Some(i);
+                                        self.preview_max_scroll = 0.0;
+                                        self.editor_max_scroll = 0.0;
                                         self.invalidate_preview();
                                     }
                                     if ui.add(egui::Button::new(RichText::new("×").size(11.0).color(self.palette.faint)).frame(false)).clicked() {
@@ -1517,6 +1562,20 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
             }
         };
         let in_split = self.mode == Mode::Split && self.settings.sync_scroll;
+        if in_split {
+            let preview_rect = ui.available_rect_before_wrap();
+            let wheel_scrolled = ui.input(|i| i.smooth_scroll_delta.y != 0.0);
+            let pointer_pressed = ui.input(|i| i.pointer.primary_pressed());
+            let pointer_pos = ui.input(|i| i.pointer.latest_pos());
+            if pointer_pressed || wheel_scrolled {
+                if let Some(pos) = pointer_pos {
+                    if preview_rect.contains(pos) {
+                        self.split_scroll_driver = SplitScrollDriver::Preview;
+                    }
+                }
+            }
+        }
+
         let mut scroll = ScrollArea::vertical()
             .id_salt(("preview_scroll", self.buffers[idx].id))
             .auto_shrink([false, false]);
@@ -1527,8 +1586,9 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 let avail = ui.available_width();
-                let content_w = (avail - 48.0).clamp(320.0, 780.0);
-                let side_margin = ((avail - content_w) * 0.5).max(20.0);
+                let max_content_w = 780.0f32.min((avail - 40.0).max(60.0));
+                let side_margin = ((avail - max_content_w) * 0.5).max(16.0).round();
+                let content_w = (avail - side_margin * 2.0).max(60.0);
                 ui.add_space(side_margin);
                 ui.vertical(|ui| {
                     ui.set_max_width(content_w);
@@ -1544,6 +1604,9 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                             preview::Cmd::Reveal(p) => {
                                 let _ = open::that(p.parent().map(|d| d.to_path_buf()).unwrap_or_default());
                             }
+                            preview::Cmd::Toast(msg) => {
+                                self.toast = Some((msg, Instant::now()));
+                            }
                         }
                     }
                 });
@@ -1553,12 +1616,10 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
         if in_split {
             let max_view = (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
             self.preview_max_scroll = max_view;
-            let pointer_in_preview = ui.rect_contains_pointer(scroll_out.inner_rect);
-            let scrolled = ui.input(|i| i.smooth_scroll_delta.y != 0.0);
-            if pointer_in_preview && scrolled {
-                self.split_scroll_driver = SplitScrollDriver::Preview;
-                if max_view > 0.0 {
-                    self.split_scroll_ratio = (scroll_out.state.offset.y / max_view).clamp(0.0, 1.0);
+            if self.split_scroll_driver == SplitScrollDriver::Preview && max_view > 0.0 {
+                let ratio = scroll_out.state.offset.y / max_view;
+                if ratio.is_finite() {
+                    self.split_scroll_ratio = ratio.clamp(0.0, 1.0);
                 }
             }
         }
@@ -1574,6 +1635,29 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
         let len = self.buffers[idx].text.len();
 
         let in_split = self.mode == Mode::Split && self.settings.sync_scroll;
+        if in_split {
+            let editor_rect = ui.max_rect();
+            let wheel_scrolled = ui.input(|i| i.smooth_scroll_delta.y != 0.0);
+            let pointer_pressed = ui.input(|i| i.pointer.primary_pressed());
+            let pointer_down = ui.input(|i| i.pointer.primary_down());
+            let pointer_pos = ui.input(|i| i.pointer.latest_pos());
+
+            // Switch driver on click or wheel; preserve active driver during drag
+            if !pointer_down || pointer_pressed {
+                if let Some(pos) = pointer_pos {
+                    if editor_rect.contains(pos) {
+                        if wheel_scrolled || pointer_pressed {
+                            self.split_scroll_driver = SplitScrollDriver::Editor;
+                        }
+                    } else if pos.x > editor_rect.right() && pos.y >= editor_rect.top() && pos.y <= editor_rect.bottom() {
+                        if wheel_scrolled || pointer_pressed {
+                            self.split_scroll_driver = SplitScrollDriver::Preview;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut scroll = if wrap {
             ScrollArea::vertical()
         } else {
@@ -1639,6 +1723,9 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                         te = te.layouter(&mut layouter);
                         let out = te.show(ui);
                         self.editor_widget = Some(out.response.id);
+                        if (is_focused && ui.input(|i| !i.events.is_empty())) || out.response.changed() {
+                            self.split_scroll_driver = SplitScrollDriver::Editor;
+                        }
                         if let Some(pc) = self.pending_cursor.take() {
                             let s = pc.sorted_cursors();
                             self.sel = Some((s[0].index.0, s[1].index.0));
@@ -1668,12 +1755,10 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
         if in_split {
             let max_edit = (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
             self.editor_max_scroll = max_edit;
-            let pointer_in_editor = ui.rect_contains_pointer(scroll_out.inner_rect);
-            let scrolled = ui.input(|i| i.smooth_scroll_delta.y != 0.0);
-            if (pointer_in_editor && scrolled) || self.split_scroll_driver == SplitScrollDriver::Editor {
-                self.split_scroll_driver = SplitScrollDriver::Editor;
-                if max_edit > 0.0 {
-                    self.split_scroll_ratio = (scroll_out.state.offset.y / max_edit).clamp(0.0, 1.0);
+            if self.split_scroll_driver == SplitScrollDriver::Editor && max_edit > 0.0 {
+                let ratio = scroll_out.state.offset.y / max_edit;
+                if ratio.is_finite() {
+                    self.split_scroll_ratio = ratio.clamp(0.0, 1.0);
                 }
             }
         }
@@ -1783,10 +1868,6 @@ fn build_base_fonts() -> egui::FontDefinitions {
         "inter_regular".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf"))),
     );
-    fonts.font_data.insert(
-        "inter_semibold".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf"))),
-    );
     if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
         family.insert(0, "inter_regular".to_owned());
     }
@@ -1800,7 +1881,7 @@ fn build_base_fonts() -> egui::FontDefinitions {
         family.insert(0, "jetbrains_mono".to_owned());
     }
 
-    crate::theme::register_bold_family(&mut fonts);
+    crate::theme::register_font_families(&mut fonts);
     fonts
 }
 
@@ -1920,6 +2001,7 @@ impl App {
                                                 ("Ctrl + 1", "View Mode (rendered preview)"),
                                                 ("Ctrl + 2", "Edit Mode (source markdown)"),
                                                 ("Ctrl + 3", "Split Mode (side-by-side with sync scroll)"),
+                                                ("Ctrl + Shift + C", "Copy as Markdown (selection or full document)"),
                                                 ("Ctrl + F", "Find & Replace bar"),
                                                 ("F3 / Shift + F3", "Find next / previous match"),
                                                 ("Ctrl + G", "Go to line number"),
@@ -2637,6 +2719,87 @@ mod tests {
     }
 
     #[test]
+    fn test_split_scroll_driver_switching_preview_and_editor() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.mode = Mode::Split;
+        app.settings.sync_scroll = true;
+        let mut text = String::new();
+        for i in 1..=200 {
+            text.push_str(&format!("Line {i} - long text markdown content\n"));
+        }
+        app.buffers[0].text = text;
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+
+        // Frame 1: Initial layout
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(screen);
+        step(&ctx, raw, |ui| {
+            app.update_impl(ui);
+        });
+
+        // Frame 2: Mouse in Preview pane (x=900, y=400) with wheel scroll
+        let mut raw_preview = egui::RawInput::default();
+        raw_preview.screen_rect = Some(screen);
+        raw_preview.events.push(egui::Event::PointerMoved(egui::pos2(900.0, 400.0)));
+        raw_preview.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -5.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        step(&ctx, raw_preview, |ui| {
+            app.update_impl(ui);
+        });
+        assert_eq!(app.split_scroll_driver, SplitScrollDriver::Preview, "Scrolling in preview must switch driver to Preview");
+
+        // Frame 3: Mouse in Editor pane (x=200, y=400) with pointer pressed (e.g. clicking scrollbar or text)
+        let mut raw_editor = egui::RawInput::default();
+        raw_editor.screen_rect = Some(screen);
+        raw_editor.events.push(egui::Event::PointerMoved(egui::pos2(200.0, 400.0)));
+        raw_editor.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(200.0, 400.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        step(&ctx, raw_editor, |ui| {
+            app.update_impl(ui);
+        });
+        assert_eq!(app.split_scroll_driver, SplitScrollDriver::Editor, "Clicking in editor must switch driver to Editor");
+    }
+
+    #[test]
+    fn test_split_scroll_disabled_when_sync_scroll_off() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.mode = Mode::Split;
+        app.settings.sync_scroll = false;
+        let mut text = String::new();
+        for i in 1..=200 {
+            text.push_str(&format!("Line {i} - long text markdown content\n"));
+        }
+        app.buffers[0].text = text;
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(screen);
+        raw.events.push(egui::Event::PointerMoved(egui::pos2(900.0, 400.0)));
+        raw.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -5.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        step(&ctx, raw, |ui| {
+            app.update_impl(ui);
+        });
+        // Split scroll driver should remain default because sync_scroll is false
+        assert_eq!(app.split_scroll_driver, SplitScrollDriver::Editor);
+    }
+
+    #[test]
     fn test_help_modal_stays_open_across_frames() {
         let ctx = egui::Context::default();
         let mut app = create_test_app(&ctx);
@@ -2701,5 +2864,57 @@ mod tests {
         app.buffers[0].text = "Hello world".to_string();
         app.ensure_cjk_if_needed(&ctx);
         assert!(!app.cjk_loaded);
+    }
+
+    #[test]
+    fn test_copy_markdown_cmd_full_document() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.buffers[0].text = "# RapidMD Test\n\nSome bold **text**.".to_string();
+        app.mode = Mode::View;
+        app.sel = None;
+        app.apply_cmd(Cmd::CopyMarkdown, &ctx);
+        assert!(app.toast.is_some());
+        let (msg, _) = app.toast.as_ref().unwrap();
+        assert!(msg.contains("Copied full Markdown document"));
+    }
+
+    #[test]
+    fn test_copy_markdown_cmd_selection() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.buffers[0].text = "# RapidMD Test\n\nSome bold **text**.".to_string();
+        app.mode = Mode::Edit;
+        // select "**text**" -> chars 26 to 34
+        app.sel = Some((26, 34));
+        app.apply_cmd(Cmd::CopyMarkdown, &ctx);
+        assert!(app.toast.is_some());
+        let (msg, _) = app.toast.as_ref().unwrap();
+        assert!(msg.contains("Copied Markdown selection (8 chars)"));
+    }
+
+    #[test]
+    fn test_shortcut_ctrl_shift_c() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        let mods = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            shift: true,
+            ..Default::default()
+        };
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::ModifiersChanged(mods));
+        input.events.push(egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        });
+        step(&ctx, input, |ui| {
+            app.update_impl(ui);
+        });
+        assert!(app.toast.is_some(), "Ctrl+Shift+C must trigger CopyMarkdown and produce a toast");
     }
 }
