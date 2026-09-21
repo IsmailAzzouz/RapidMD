@@ -38,7 +38,7 @@
 
 Download the ready-to-run setup wizard:
 
-👉 **[Download RapidMD-Setup-v0.1.0.exe (Latest Release)](https://github.com/IsmailAzzouz/RapidMD/releases/download/v0.1.0/RapidMD-Setup-v0.1.0.exe)** *(~6.2 MB)*
+👉 **[Download RapidMD-Setup-v0.2.0.exe (Latest Release)](https://github.com/IsmailAzzouz/RapidMD/releases/download/v0.2.0/RapidMD-Setup-v0.2.0.exe)** *(~6.2 MB)*
 
 #### What the Installer Does:
 - Installs RapidMD into `Program Files` (or `%LocalAppData%\Programs\RapidMD`).
@@ -80,7 +80,7 @@ The compiled standalone executable is generated at `target/release/rapidmd.exe`.
 iscc installer/rapidmd.iss
 ```
 
-The installer executable will be output to `installer/dist/RapidMD-Setup-v0.1.0.exe`.
+The installer executable will be output to `installer/dist/RapidMD-Setup-v0.2.0.exe`.
 
 ---
 

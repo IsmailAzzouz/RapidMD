@@ -31,6 +31,6 @@ if %errorlevel% neq 0 (
 echo.
 echo ========================================================
 echo Installer successfully created!
-echo Location: installer\dist\RapidMD-Setup-v0.1.0.exe
+echo Location: installer\dist\RapidMD-Setup-v0.2.0.exe
 echo ========================================================
 pause

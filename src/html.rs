@@ -364,6 +364,7 @@ pub enum HtmlBlockAction {
 pub fn parse_html_block_content(html: &str) -> Vec<HtmlBlockAction> {
     let tokens = tokenize_html(html);
     let mut actions = Vec::new();
+    let mut center_tags: Vec<String> = Vec::new();
     let mut i = 0;
     let n = tokens.len();
 
@@ -372,6 +373,7 @@ pub fn parse_html_block_content(html: &str) -> Vec<HtmlBlockAction> {
             HtmlToken::TagOpen { name, attrs, self_closing: _ } => {
                 let name_str = name.as_str();
                 if is_center_align(name_str, attrs) {
+                    center_tags.push(name.to_ascii_lowercase());
                     actions.push(HtmlBlockAction::OpenCenter);
                     i += 1;
                     continue;
@@ -534,7 +536,11 @@ pub fn parse_html_block_content(html: &str) -> Vec<HtmlBlockAction> {
                 }
             }
             HtmlToken::TagClose { name } => {
-                if name == "div" || name == "center" {
+                let name_lower = name.to_ascii_lowercase();
+                if let Some(pos) = center_tags.iter().rposition(|tag| tag == &name_lower) {
+                    center_tags.remove(pos);
+                    actions.push(HtmlBlockAction::CloseCenter);
+                } else if matches!(name_lower.as_str(), "div" | "center" | "p" | "section" | "header" | "footer") {
                     actions.push(HtmlBlockAction::CloseCenter);
                 }
                 i += 1;
@@ -617,5 +623,15 @@ mod tests {
         let actions = parse_html_block_content(html);
         assert_eq!(actions.len(), 1);
         assert!(matches!(&actions[0], HtmlBlockAction::Block(Block::Para(_))));
+    }
+
+    #[test]
+    fn test_p_align_center_emits_open_and_close() {
+        let html = r#"<p align="center">
+  <img src="assets/header.svg" width="100%" alt="header">
+</p>"#;
+        let actions = parse_html_block_content(html);
+        assert!(matches!(actions.first(), Some(HtmlBlockAction::OpenCenter)));
+        assert!(matches!(actions.last(), Some(HtmlBlockAction::CloseCenter)));
     }
 }

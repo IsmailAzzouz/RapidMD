@@ -2,7 +2,7 @@
 ; Generates standalone modern Windows installer executable
 
 #define MyAppName "RapidMD"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "RapidMD"
 #define MyAppExeName "rapidmd.exe"
 

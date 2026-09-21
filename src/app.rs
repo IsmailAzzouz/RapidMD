@@ -68,9 +68,10 @@ enum Cmd {
     ToggleFps,
     GoToLine,
     About,
+    CopyMarkdown,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SplitScrollDriver {
     Editor,
     Preview,
@@ -599,6 +600,10 @@ impl App {
             push(self, Cmd::FindPrev);
         } else if kp(ctx, Key::F3) {
             push(self, Cmd::FindNext);
+        } else if cmd && shift && kp(ctx, Key::C) {
+            push(self, Cmd::CopyMarkdown);
+        } else if self.mode == Mode::View && cmd && !shift && kp(ctx, Key::C) {
+            self.toast = Some(("Copied selection to clipboard".to_string(), Instant::now()));
         } else if cmd && kp(ctx, Key::Num1) {
             push(self, Cmd::Mode(Mode::View));
         } else if cmd && kp(ctx, Key::Num2) {
@@ -688,6 +693,10 @@ impl App {
                 }
             }
             Cmd::Mode(m) => {
+                if self.mode != m {
+                    self.preview_max_scroll = 0.0;
+                    self.editor_max_scroll = 0.0;
+                }
                 self.mode = m;
                 self.invalidate_preview();
             }
@@ -773,6 +782,8 @@ impl App {
             }
             Cmd::SyncScroll => {
                 self.settings.sync_scroll = !self.settings.sync_scroll;
+                self.preview_max_scroll = 0.0;
+                self.editor_max_scroll = 0.0;
                 self.settings.save();
             }
             Cmd::ToggleFps => {
@@ -784,7 +795,34 @@ impl App {
                 self.modal = Some(Modal::GoTo { idx: self.active.unwrap_or(0) });
             }
             Cmd::About => self.modal = Some(Modal::About),
+            Cmd::CopyMarkdown => self.copy_markdown(ctx),
         }
+    }
+
+    /// Copies either the selected Markdown source or the entire document to the system clipboard.
+    /// Complexity: O(N) where N is the character length of the copied document slice.
+    fn copy_markdown(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.active else { return };
+        let text = self.buffers[idx].text.clone();
+        let (to_copy, msg) = if (self.mode == Mode::Edit || self.mode == Mode::Split) && self.sel.is_some() {
+            let sel = self.sel_bytes();
+            if !sel.is_empty() && sel.end <= text.len() {
+                let slice = text[sel].to_string();
+                let len = slice.chars().count();
+                (slice, format!("Copied Markdown selection ({} chars)", len))
+            } else {
+                let len = text.chars().count();
+                (text, format!("Copied full Markdown document ({} chars)", len))
+            }
+        } else {
+            let len = text.chars().count();
+            (text, format!("Copied full Markdown document ({} chars)", len))
+        };
+        ctx.copy_text(to_copy.clone());
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(to_copy);
+        }
+        self.toast = Some((msg, Instant::now()));
     }
 
     fn zoom(&mut self, factor: f32, ctx: &egui::Context) {
@@ -795,12 +833,13 @@ impl App {
 
     // ------------------------------------------------------------ eframe
 
-    fn update_impl(&mut self, ctx: &egui::Context) {
+    fn update_impl(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        let ctx = ui.ctx().clone();
         self.ctx_handle = Some(ctx.clone());
-        self.handle_keys(ctx);
+        self.handle_keys(&ctx);
 
         if !self.cjk_loaded {
-            self.ensure_cjk_if_needed(ctx);
+            self.ensure_cjk_if_needed(&ctx);
         }
 
         let now = Instant::now();
@@ -843,7 +882,20 @@ impl App {
             }
         }
 
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|d| d.path.clone()).collect());
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|d| {
+                    let p = d.path();
+                    if p.as_os_str().is_empty() {
+                        None
+                    } else {
+                        Some(p.to_path_buf())
+                    }
+                })
+                .collect()
+        });
         for p in dropped {
             self.open_path(&p, true);
         }
@@ -853,23 +905,23 @@ impl App {
         let modal = self.modal.take();
 
         let panel_frame = egui::Frame::new().fill(self.palette.panel_bg).stroke(egui::Stroke::new(1.0, self.palette.hr));
-        egui::TopBottomPanel::top("menu").frame(panel_frame).exact_height(26.0).show(ctx, |ui| {
+        egui::Panel::top("menu").frame(panel_frame).exact_size(26.0).show(ui, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| self.menu_row(ui));
         });
-        egui::TopBottomPanel::top("tool").frame(panel_frame).exact_height(32.0).show(ctx, |ui| {
+        egui::Panel::top("tool").frame(panel_frame).exact_size(32.0).show(ui, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| self.tool_row(ui));
         });
         if self.buffers.len() > 1 {
-            egui::TopBottomPanel::top("tabs").frame(panel_frame).exact_height(24.0).show(ctx, |ui| {
+            egui::Panel::top("tabs").frame(panel_frame).exact_size(24.0).show(ui, |ui| {
                 ui.add_enabled_ui(modal.is_none(), |ui| self.tab_row(ui));
             });
         }
         if self.find.open && self.active.is_some() {
-            egui::TopBottomPanel::top("find").frame(panel_frame).exact_height(28.0).show(ctx, |ui| {
+            egui::Panel::top("find").frame(panel_frame).exact_size(28.0).show(ui, |ui| {
                 ui.add_enabled_ui(modal.is_none(), |ui| self.find_row(ui));
             });
         }
-        egui::TopBottomPanel::bottom("status").frame(panel_frame).exact_height(22.0).show(ctx, |ui| {
+        egui::Panel::bottom("status").frame(panel_frame).exact_size(22.0).show(ui, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| self.status_row(ui));
         });
 
@@ -881,20 +933,20 @@ impl App {
                 top: 8,
                 bottom: 4,
             });
-        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
+        let central_resp = egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
             ui.add_enabled_ui(modal.is_none(), |ui| {
                 if let Some(i) = self.active {
                     match self.mode {
                         Mode::View => self.view_pane(ui, i),
                         Mode::Edit => self.edit_pane(ui, i),
                         Mode::Split => {
-                            egui::SidePanel::left("split")
+                            egui::Panel::left("split")
                                 .resizable(true)
-                                .min_width(120.0)
-                                .max_width((ui.available_width() - 120.0).max(120.0))
-                                .default_width(ui.available_width() * 0.5)
+                                .min_size(120.0)
+                                .max_size((ui.available_width() - 120.0).max(120.0))
+                                .default_size(ui.available_width() * 0.5)
                                 .frame(egui::Frame::new().fill(self.palette.window_bg).stroke(egui::Stroke::new(1.0, self.palette.hr)))
-                                .show_inside(ui, |ui| self.edit_pane(ui, i));
+                                .show(ui, |ui| self.edit_pane(ui, i));
                             self.view_pane(ui, i);
                         }
                     }
@@ -904,14 +956,15 @@ impl App {
             });
         });
 
-        self.toast_ui(ctx);
+        self.toast_ui(&ctx);
         if let Some(m) = modal {
-            let screen_rect = ctx.screen_rect();
+            let screen_rect = ctx.viewport_rect();
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("modal_backdrop")));
             painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(100));
-            self.modal_ui(ctx, m);
+            self.modal_ui(&ctx, m);
         }
-        self.flush(ctx);
+        self.flush(&ctx);
+        central_resp.response.rect
     }
 
     fn flush(&mut self, ctx: &egui::Context) {
@@ -977,16 +1030,16 @@ impl App {
             visuals.selection.stroke = egui::Stroke::NONE;
             visuals.selection.bg_fill = visuals.widgets.hovered.bg_fill;
 
-            egui::menu::bar(ui, |ui| {
+            egui::menu::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button(RichText::new("File").size(13.0).color(pal.text), |ui| {
                     ui.set_min_width(200.0);
                     if menu_item(ui, "New Document", "Ctrl+N", None, &pal).clicked() {
                         self.pending.push(Cmd::New);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Open…", "Ctrl+O", None, &pal).clicked() {
                         self.pending.push(Cmd::Open);
-                        ui.close_menu();
+                        ui.close();
                     }
                     menu_separator(ui, &pal);
                     let recents = self.settings.recent_paths();
@@ -997,7 +1050,7 @@ impl App {
                                 let name = r.file_name().and_then(|n| n.to_str()).unwrap_or("document");
                                 if menu_item(ui, name, "", None, &pal).on_hover_text(r.display().to_string()).clicked() {
                                     self.pending.push(Cmd::OpenRecent(r));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             }
                         });
@@ -1005,32 +1058,37 @@ impl App {
                     }
                     if menu_item(ui, "Save", "Ctrl+S", None, &pal).clicked() {
                         self.pending.push(Cmd::Save);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Save As…", "Ctrl+Shift+S", None, &pal).clicked() {
                         self.pending.push(Cmd::SaveAs);
-                        ui.close_menu();
+                        ui.close();
                     }
                     menu_separator(ui, &pal);
                     if menu_item(ui, "Close Tab", "Ctrl+W", None, &pal).clicked() {
                         self.pending.push(Cmd::CloseTab);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Quit", "Ctrl+Shift+W", None, &pal).clicked() {
                         self.pending.push(Cmd::Quit);
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
                 ui.menu_button(RichText::new("Edit").size(13.0).color(pal.text), |ui| {
                     ui.set_min_width(180.0);
+                    if menu_item(ui, "Copy as Markdown", "Ctrl+Shift+C", None, &pal).clicked() {
+                        self.pending.push(Cmd::CopyMarkdown);
+                        ui.close();
+                    }
+                    menu_separator(ui, &pal);
                     if menu_item(ui, "Find / Replace", "Ctrl+F", None, &pal).clicked() {
                         self.pending.push(Cmd::FindBar);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Go to Line…", "Ctrl+G", None, &pal).clicked() {
                         self.pending.push(Cmd::GoToLine);
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -1038,15 +1096,15 @@ impl App {
                     ui.set_min_width(220.0);
                     if menu_item(ui, "View", "Ctrl+1", Some(self.mode == Mode::View), &pal).clicked() {
                         self.pending.push(Cmd::Mode(Mode::View));
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Edit", "Ctrl+2", Some(self.mode == Mode::Edit), &pal).clicked() {
                         self.pending.push(Cmd::Mode(Mode::Edit));
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Split", "Ctrl+3", Some(self.mode == Mode::Split), &pal).clicked() {
                         self.pending.push(Cmd::Mode(Mode::Split));
-                        ui.close_menu();
+                        ui.close();
                     }
                     menu_separator(ui, &pal);
                     ui.menu_button("Theme", |ui| {
@@ -1054,39 +1112,39 @@ impl App {
                         for t in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::System] {
                             if menu_item(ui, t.label(), "", Some(self.settings.theme == t), &pal).clicked() {
                                 self.pending.push(Cmd::Theme(t));
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     });
                     menu_separator(ui, &pal);
                     if menu_toggle(ui, "Wrap editor text", self.settings.wrap_editor, &pal).clicked() {
                         self.pending.push(Cmd::Wrap);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_toggle(ui, "Line numbers", self.settings.show_line_numbers, &pal).clicked() {
                         self.pending.push(Cmd::Numbers);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_toggle(ui, "Sync scroll in split view", self.settings.sync_scroll, &pal).clicked() {
                         self.pending.push(Cmd::SyncScroll);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_toggle(ui, "Show FPS counter", self.settings.show_fps, &pal).clicked() {
                         self.pending.push(Cmd::ToggleFps);
-                        ui.close_menu();
+                        ui.close();
                     }
                     menu_separator(ui, &pal);
                     if menu_item(ui, "Zoom In", "Ctrl+=", None, &pal).clicked() {
                         self.pending.push(Cmd::ZoomIn);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Zoom Out", "Ctrl+-", None, &pal).clicked() {
                         self.pending.push(Cmd::ZoomOut);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if menu_item(ui, "Reset zoom", "Ctrl+0", None, &pal).clicked() {
                         self.pending.push(Cmd::ZoomReset);
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -1253,6 +1311,8 @@ impl App {
                                     let text_color = if is_active { self.palette.text } else { self.palette.faint };
                                     if ui.add(egui::Label::new(RichText::new(name).color(text_color).strong().size(12.0)).sense(Sense::click())).clicked() {
                                         self.active = Some(i);
+                                        self.preview_max_scroll = 0.0;
+                                        self.editor_max_scroll = 0.0;
                                         self.invalidate_preview();
                                     }
                                     if ui.add(egui::Button::new(RichText::new("×").size(11.0).color(self.palette.faint)).frame(false)).clicked() {
@@ -1502,6 +1562,20 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
             }
         };
         let in_split = self.mode == Mode::Split && self.settings.sync_scroll;
+        if in_split {
+            let preview_rect = ui.available_rect_before_wrap();
+            let wheel_scrolled = ui.input(|i| i.smooth_scroll_delta.y != 0.0);
+            let pointer_pressed = ui.input(|i| i.pointer.primary_pressed());
+            let pointer_pos = ui.input(|i| i.pointer.latest_pos());
+            if pointer_pressed || wheel_scrolled {
+                if let Some(pos) = pointer_pos {
+                    if preview_rect.contains(pos) {
+                        self.split_scroll_driver = SplitScrollDriver::Preview;
+                    }
+                }
+            }
+        }
+
         let mut scroll = ScrollArea::vertical()
             .id_salt(("preview_scroll", self.buffers[idx].id))
             .auto_shrink([false, false]);
@@ -1512,8 +1586,9 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 let avail = ui.available_width();
-                let content_w = (avail - 48.0).clamp(320.0, 780.0);
-                let side_margin = ((avail - content_w) * 0.5).max(20.0);
+                let max_content_w = 780.0f32.min((avail - 40.0).max(60.0));
+                let side_margin = ((avail - max_content_w) * 0.5).max(16.0).round();
+                let content_w = (avail - side_margin * 2.0).max(60.0);
                 ui.add_space(side_margin);
                 ui.vertical(|ui| {
                     ui.set_max_width(content_w);
@@ -1529,6 +1604,9 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                             preview::Cmd::Reveal(p) => {
                                 let _ = open::that(p.parent().map(|d| d.to_path_buf()).unwrap_or_default());
                             }
+                            preview::Cmd::Toast(msg) => {
+                                self.toast = Some((msg, Instant::now()));
+                            }
                         }
                     }
                 });
@@ -1538,12 +1616,10 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
         if in_split {
             let max_view = (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
             self.preview_max_scroll = max_view;
-            let pointer_in_preview = ui.rect_contains_pointer(scroll_out.inner_rect);
-            let scrolled = ui.input(|i| i.smooth_scroll_delta.y != 0.0);
-            if pointer_in_preview && scrolled {
-                self.split_scroll_driver = SplitScrollDriver::Preview;
-                if max_view > 0.0 {
-                    self.split_scroll_ratio = (scroll_out.state.offset.y / max_view).clamp(0.0, 1.0);
+            if self.split_scroll_driver == SplitScrollDriver::Preview && max_view > 0.0 {
+                let ratio = scroll_out.state.offset.y / max_view;
+                if ratio.is_finite() {
+                    self.split_scroll_ratio = ratio.clamp(0.0, 1.0);
                 }
             }
         }
@@ -1559,6 +1635,29 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
         let len = self.buffers[idx].text.len();
 
         let in_split = self.mode == Mode::Split && self.settings.sync_scroll;
+        if in_split {
+            let editor_rect = ui.max_rect();
+            let wheel_scrolled = ui.input(|i| i.smooth_scroll_delta.y != 0.0);
+            let pointer_pressed = ui.input(|i| i.pointer.primary_pressed());
+            let pointer_down = ui.input(|i| i.pointer.primary_down());
+            let pointer_pos = ui.input(|i| i.pointer.latest_pos());
+
+            // Switch driver on click or wheel; preserve active driver during drag
+            if !pointer_down || pointer_pressed {
+                if let Some(pos) = pointer_pos {
+                    if editor_rect.contains(pos) {
+                        if wheel_scrolled || pointer_pressed {
+                            self.split_scroll_driver = SplitScrollDriver::Editor;
+                        }
+                    } else if pos.x > editor_rect.right() && pos.y >= editor_rect.top() && pos.y <= editor_rect.bottom() {
+                        if wheel_scrolled || pointer_pressed {
+                            self.split_scroll_driver = SplitScrollDriver::Preview;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut scroll = if wrap {
             ScrollArea::vertical()
         } else {
@@ -1609,7 +1708,8 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                             .margin(Margin::symmetric(12, 6));
                         let use_syntax = len < MAX_SYNTAX_CHARS;
                         let m2 = matches.clone();
-                        let mut layouter = move |ui: &egui::Ui, text: &str, width: f32| {
+                        let mut layouter = move |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, width: f32| {
+                            let text = buffer.as_str();
                             let max_w = if wrap { width.min(avail_w).max(80.0) } else { f32::INFINITY };
                             let mut job = if use_syntax {
                                 editor::editor_job(text, &pal, font.clone(), &m2)
@@ -1618,14 +1718,17 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                             };
                             job.wrap.max_width = max_w;
                             job.wrap.break_anywhere = true;
-                            ui.fonts(|f| f.layout_job(job))
+                            ui.fonts_mut(|f| f.layout_job(job))
                         };
                         te = te.layouter(&mut layouter);
                         let out = te.show(ui);
                         self.editor_widget = Some(out.response.id);
+                        if (is_focused && ui.input(|i| !i.events.is_empty())) || out.response.changed() {
+                            self.split_scroll_driver = SplitScrollDriver::Editor;
+                        }
                         if let Some(pc) = self.pending_cursor.take() {
-                            let s = pc.sorted();
-                            self.sel = Some((s[0].index, s[1].index));
+                            let s = pc.sorted_cursors();
+                            self.sel = Some((s[0].index.0, s[1].index.0));
                             if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), out.response.id) {
                                 st.cursor.set_char_range(Some(pc));
                                 st.store(ui.ctx(), out.response.id);
@@ -1637,7 +1740,7 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                             self.focus_editor = false;
                         } else if let Some(r) = out.cursor_range {
                             let s = r.sorted_cursors();
-                            self.sel = Some((s[0].ccursor.index, s[1].ccursor.index));
+                            self.sel = Some((s[0].index.0, s[1].index.0));
                         }
                         if out.response.changed() {
                             self.invalidate_preview();
@@ -1652,12 +1755,10 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
         if in_split {
             let max_edit = (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
             self.editor_max_scroll = max_edit;
-            let pointer_in_editor = ui.rect_contains_pointer(scroll_out.inner_rect);
-            let scrolled = ui.input(|i| i.smooth_scroll_delta.y != 0.0);
-            if (pointer_in_editor && scrolled) || self.split_scroll_driver == SplitScrollDriver::Editor {
-                self.split_scroll_driver = SplitScrollDriver::Editor;
-                if max_edit > 0.0 {
-                    self.split_scroll_ratio = (scroll_out.state.offset.y / max_edit).clamp(0.0, 1.0);
+            if self.split_scroll_driver == SplitScrollDriver::Editor && max_edit > 0.0 {
+                let ratio = scroll_out.state.offset.y / max_edit;
+                if ratio.is_finite() {
+                    self.split_scroll_ratio = ratio.clamp(0.0, 1.0);
                 }
             }
         }
@@ -1685,10 +1786,10 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
     }
 }
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.update_impl(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.update_impl(ui);
     }
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.settings.save();
         clear_recovery();
     }
@@ -1767,10 +1868,6 @@ fn build_base_fonts() -> egui::FontDefinitions {
         "inter_regular".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf"))),
     );
-    fonts.font_data.insert(
-        "inter_semibold".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf"))),
-    );
     if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
         family.insert(0, "inter_regular".to_owned());
     }
@@ -1784,7 +1881,7 @@ fn build_base_fonts() -> egui::FontDefinitions {
         family.insert(0, "jetbrains_mono".to_owned());
     }
 
-    crate::theme::register_bold_family(&mut fonts);
+    crate::theme::register_font_families(&mut fonts);
     fonts
 }
 
@@ -1850,7 +1947,7 @@ impl App {
                                             .corner_radius(5.0)
                                             .inner_margin(egui::Margin::symmetric(6, 2))
                                             .show(ui, |ui| {
-                                                ui.label(RichText::new("v0.1.0").monospace().color(self.palette.faint).size(10.5));
+                                                ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).monospace().color(self.palette.faint).size(10.5));
                                             });
                                     });
                                     ui.add_space(2.0);
@@ -1869,12 +1966,12 @@ impl App {
                                         .show(ui, |ui| {
                                             let tech = [
                                                 ("Rust", "Safe, concurrent native systems language (2021 edition)"),
-                                                ("eframe & egui", "0.31 immediate-mode GPU-accelerated GUI with embedded Inter font"),
-                                                ("pulldown-cmark", "0.12 pull-parser for CommonMark, GFM tables & task lists"),
+                                                ("eframe & egui", "0.36 immediate-mode GPU-accelerated GUI with embedded Inter font"),
+                                                ("pulldown-cmark", "0.13 pull-parser for CommonMark, GFM tables & task lists"),
                                                 ("syntect", "5.3 syntax highlighter using TextMate grammars"),
                                                 ("image", "0.25 pure-Rust local image decoding (PNG, JPEG, WebP, GIF)"),
                                                 ("arboard", "3.0 cross-platform native clipboard engine"),
-                                                ("rfd", "0.15 native system file/folder dialogs"),
+                                                ("rfd", "0.17 native system file/folder dialogs"),
                                             ];
                                             for (k, desc) in tech {
                                                 ui.label(RichText::new(k).strong().color(self.palette.text).size(12.0));
@@ -1904,6 +2001,7 @@ impl App {
                                                 ("Ctrl + 1", "View Mode (rendered preview)"),
                                                 ("Ctrl + 2", "Edit Mode (source markdown)"),
                                                 ("Ctrl + 3", "Split Mode (side-by-side with sync scroll)"),
+                                                ("Ctrl + Shift + C", "Copy as Markdown (selection or full document)"),
                                                 ("Ctrl + F", "Find & Replace bar"),
                                                 ("F3 / Shift + F3", "Find next / previous match"),
                                                 ("Ctrl + G", "Go to line number"),
@@ -2386,6 +2484,15 @@ mod tests {
         app
     }
 
+    fn step<R>(ctx: &egui::Context, raw_input: egui::RawInput, mut run_ui: impl FnMut(&mut egui::Ui) -> R) -> R {
+        let mut res = None;
+        let mut out = ctx.run_ui(raw_input, |ui| {
+            res = Some(run_ui(ui));
+        });
+        out.textures_delta.clear();
+        res.unwrap()
+    }
+
     #[test]
     fn test_app_smart_enter_bullet_flow() {
         let ctx = egui::Context::default();
@@ -2394,10 +2501,10 @@ mod tests {
         app.sel = Some((7, 7));
 
         // Frame 1: render editor, request focus
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
             if let Some(id) = app.editor_widget {
-                ctx.memory_mut(|m| m.request_focus(id));
+                ui.ctx().memory_mut(|m| m.request_focus(id));
             }
         });
 
@@ -2410,8 +2517,8 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(raw_enter, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw_enter, |ui| {
+            app.update_impl(ui);
         });
         assert_eq!(app.buffers[0].text, "- first\n- ");
 
@@ -2424,8 +2531,8 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(raw_enter2, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw_enter2, |ui| {
+            app.update_impl(ui);
         });
         // Empty bullet is removed!
         assert_eq!(app.buffers[0].text, "- first\n");
@@ -2439,10 +2546,10 @@ mod tests {
         app.sel = Some((8, 8));
 
         // Frame 1: render editor, request focus
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
             if let Some(id) = app.editor_widget {
-                ctx.memory_mut(|m| m.request_focus(id));
+                ui.ctx().memory_mut(|m| m.request_focus(id));
             }
         });
 
@@ -2455,8 +2562,8 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(raw_enter, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw_enter, |ui| {
+            app.update_impl(ui);
         });
         assert_eq!(app.buffers[0].text, "1. first\n2. ");
 
@@ -2469,8 +2576,8 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(raw_enter2, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw_enter2, |ui| {
+            app.update_impl(ui);
         });
         assert_eq!(app.buffers[0].text, "1. first\n");
     }
@@ -2482,8 +2589,8 @@ mod tests {
         app.buffers[0].text = "section title".to_string();
         app.sel = Some((0, 0));
         app.pending.push(Cmd::Heading(3));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
         assert_eq!(app.buffers[0].text, "### section title");
     }
@@ -2499,29 +2606,29 @@ mod tests {
 
         // 1. Insert row above
         app.pending.push(Cmd::TableOp(TableCmd::InsertRowAbove));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
         assert!(app.buffers[0].text.lines().count() >= 6);
 
         // 2. Insert row below
         app.pending.push(Cmd::TableOp(TableCmd::InsertRowBelow));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
         assert!(app.buffers[0].text.lines().count() >= 7);
 
         // 3. Insert column left
         app.pending.push(Cmd::TableOp(TableCmd::InsertColLeft));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
 
         // 4. Insert column right
         app.pending.push(Cmd::TableOp(TableCmd::InsertColRight));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
 
         // 5. Delete row
         app.pending.push(Cmd::TableOp(TableCmd::DeleteRow));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
 
         // 6. Delete column
         app.pending.push(Cmd::TableOp(TableCmd::DeleteCol));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_impl(ctx));
+        step(&ctx, egui::RawInput::default(), |ui| app.update_impl(ui));
     }
 
     #[test]
@@ -2531,8 +2638,8 @@ mod tests {
         app.modal = Some(Modal::TablePicker { idx: 0 });
 
         // Frame renders with modal active: editor_widget and panels should still be created
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
 
         assert!(app.modal.is_some(), "modal remains open");
@@ -2546,12 +2653,11 @@ mod tests {
         raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0)));
         let mut app = create_test_app(&ctx);
         app.add_untitled();
-        let _ = ctx.run(raw.clone(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw.clone(), |ui| {
+            app.update_impl(ui);
         });
-        let _ = ctx.run(raw, |ctx| {
-            app.update_impl(ctx);
-            let avail = ctx.available_rect();
+        step(&ctx, raw, |ui| {
+            let avail = app.update_impl(ui);
             assert!(avail.min.y <= 90.0, "tabs panel height must be compact without black gap, got min.y={}", avail.min.y);
         });
     }
@@ -2567,8 +2673,8 @@ mod tests {
         app.settings.wrap_editor = false;
         app.buffers[0].text = "This is a very long line of text that should wrap inside the split pane editor instead of extending past the split boundary and getting hidden by the preview pane on the right.".to_string();
 
-        let _ = ctx.run(raw, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, raw, |ui| {
+            app.update_impl(ui);
             // The editor widget should have been rendered and its ID recorded
             assert!(app.editor_widget.is_some());
         });
@@ -2582,20 +2688,20 @@ mod tests {
         app.sel = Some((0, 0));
 
         // Frame 1: render app
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
 
         // User clicks H3 on toolbar:
         app.pending.push(Cmd::Heading(3));
 
         // Frame 2: app runs flush, applies Heading(3), edit_pane renders and calls request_focus
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
         // Frame 3: edit_pane runs with focus_editor = true and requests focus
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
             let editor_id = app.editor_widget.expect("editor must have ID");
             assert!(ctx.memory(|m| m.has_focus(editor_id)), "Editor must automatically regain focus after toolbar action!");
         });
@@ -2613,20 +2719,101 @@ mod tests {
     }
 
     #[test]
+    fn test_split_scroll_driver_switching_preview_and_editor() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.mode = Mode::Split;
+        app.settings.sync_scroll = true;
+        let mut text = String::new();
+        for i in 1..=200 {
+            text.push_str(&format!("Line {i} - long text markdown content\n"));
+        }
+        app.buffers[0].text = text;
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+
+        // Frame 1: Initial layout
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(screen);
+        step(&ctx, raw, |ui| {
+            app.update_impl(ui);
+        });
+
+        // Frame 2: Mouse in Preview pane (x=900, y=400) with wheel scroll
+        let mut raw_preview = egui::RawInput::default();
+        raw_preview.screen_rect = Some(screen);
+        raw_preview.events.push(egui::Event::PointerMoved(egui::pos2(900.0, 400.0)));
+        raw_preview.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -5.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        step(&ctx, raw_preview, |ui| {
+            app.update_impl(ui);
+        });
+        assert_eq!(app.split_scroll_driver, SplitScrollDriver::Preview, "Scrolling in preview must switch driver to Preview");
+
+        // Frame 3: Mouse in Editor pane (x=200, y=400) with pointer pressed (e.g. clicking scrollbar or text)
+        let mut raw_editor = egui::RawInput::default();
+        raw_editor.screen_rect = Some(screen);
+        raw_editor.events.push(egui::Event::PointerMoved(egui::pos2(200.0, 400.0)));
+        raw_editor.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(200.0, 400.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        step(&ctx, raw_editor, |ui| {
+            app.update_impl(ui);
+        });
+        assert_eq!(app.split_scroll_driver, SplitScrollDriver::Editor, "Clicking in editor must switch driver to Editor");
+    }
+
+    #[test]
+    fn test_split_scroll_disabled_when_sync_scroll_off() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.mode = Mode::Split;
+        app.settings.sync_scroll = false;
+        let mut text = String::new();
+        for i in 1..=200 {
+            text.push_str(&format!("Line {i} - long text markdown content\n"));
+        }
+        app.buffers[0].text = text;
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(screen);
+        raw.events.push(egui::Event::PointerMoved(egui::pos2(900.0, 400.0)));
+        raw.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -5.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        step(&ctx, raw, |ui| {
+            app.update_impl(ui);
+        });
+        // Split scroll driver should remain default because sync_scroll is false
+        assert_eq!(app.split_scroll_driver, SplitScrollDriver::Editor);
+    }
+
+    #[test]
     fn test_help_modal_stays_open_across_frames() {
         let ctx = egui::Context::default();
         let mut app = create_test_app(&ctx);
 
         // Frame 1: trigger About
         app.pending.push(Cmd::About);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
         assert!(matches!(app.modal, Some(Modal::About)));
 
         // Frame 2: modal should stay open, not disappear
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
         });
         assert!(matches!(app.modal, Some(Modal::About)), "Modal::About must persist across frames until closed");
 
@@ -2639,8 +2826,8 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(esc_input, |ctx| {
-            app.update_impl(ctx);
+        step(&ctx, esc_input, |ui| {
+            app.update_impl(ui);
         });
         assert!(app.modal.is_none(), "Escape must dismiss the help modal");
     }
@@ -2677,5 +2864,57 @@ mod tests {
         app.buffers[0].text = "Hello world".to_string();
         app.ensure_cjk_if_needed(&ctx);
         assert!(!app.cjk_loaded);
+    }
+
+    #[test]
+    fn test_copy_markdown_cmd_full_document() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.buffers[0].text = "# RapidMD Test\n\nSome bold **text**.".to_string();
+        app.mode = Mode::View;
+        app.sel = None;
+        app.apply_cmd(Cmd::CopyMarkdown, &ctx);
+        assert!(app.toast.is_some());
+        let (msg, _) = app.toast.as_ref().unwrap();
+        assert!(msg.contains("Copied full Markdown document"));
+    }
+
+    #[test]
+    fn test_copy_markdown_cmd_selection() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.buffers[0].text = "# RapidMD Test\n\nSome bold **text**.".to_string();
+        app.mode = Mode::Edit;
+        // select "**text**" -> chars 26 to 34
+        app.sel = Some((26, 34));
+        app.apply_cmd(Cmd::CopyMarkdown, &ctx);
+        assert!(app.toast.is_some());
+        let (msg, _) = app.toast.as_ref().unwrap();
+        assert!(msg.contains("Copied Markdown selection (8 chars)"));
+    }
+
+    #[test]
+    fn test_shortcut_ctrl_shift_c() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        let mods = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            shift: true,
+            ..Default::default()
+        };
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::ModifiersChanged(mods));
+        input.events.push(egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        });
+        step(&ctx, input, |ui| {
+            app.update_impl(ui);
+        });
+        assert!(app.toast.is_some(), "Ctrl+Shift+C must trigger CopyMarkdown and produce a toast");
     }
 }

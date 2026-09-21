@@ -102,11 +102,11 @@ pub fn find_layouter<'a>(
     pal: Palette,
     font: FontId,
     matches: Arc<Vec<std::ops::Range<usize>>>,
-) -> impl FnMut(&egui::Ui, &str, f32) -> Arc<egui::Galley> + 'a {
-    move |ui, text, wrap_width| {
-        let mut job = editor_job(text, &pal, font.clone(), &matches);
+) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> Arc<egui::Galley> + 'a {
+    move |ui, buffer, wrap_width| {
+        let mut job = editor_job(buffer.as_str(), &pal, font.clone(), &matches);
         job.wrap.max_width = wrap_width;
-        ui.fonts(|f| f.layout_job(job))
+        ui.fonts_mut(|f| f.layout_job(job))
     }
 }
 
