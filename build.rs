@@ -4,7 +4,7 @@ fn main() {
         let mut res = winres::WindowsResource::new();
         res.set_icon("assets/Icon/RMD.ico");
         res.set_manifest(r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
-  <assemblyIdentity version="0.2.0.0" name="RapidMD" type="win32"/>
+<assemblyIdentity version="0.3.0.0" name="RapidMD" type="win32"/>
   <description>RapidMD</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>

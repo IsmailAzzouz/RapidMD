@@ -27,39 +27,140 @@ pub enum Cmd {
 }
 
 // ---------------------------------------------------------------------------
-// Image cache (local images decoded once, spec F28)
+// Block height cache - makes preview rendering O(viewport) instead of O(doc)
+// ---------------------------------------------------------------------------
+
+/// Height assumed for a block that has never been laid out. Only affects the
+/// very first frame after a document (re)parse; every later frame uses the
+/// measured value.
+const UNMEASURED_H: f32 = 26.0;
+/// Extra pixels rendered above and below the viewport, so a small scroll does
+/// not reveal blank space before the next frame lays those blocks out.
+const OVERSCAN_PX: f32 = 220.0;
+/// Identity of a height cache: heights depend on the text, the wrap width and
+/// the base font size, so any change to one of them invalidates the whole table.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct HeightKey {
+    pub buffer: u64,
+    pub revision: u64,
+    pub width_px: u32,
+    pub base_font_bits: u32,
+}
+
+/// Per-block heights for one document, indexed exactly like `Doc::blocks`.
+/// `Vec<f32>` is reused across documents so scrolling never reallocates.
+#[derive(Default)]
+pub struct BlockHeights {
+    key: Option<HeightKey>,
+    heights: Vec<f32>,
+}
+
+impl BlockHeights {
+    pub fn begin(&mut self, key: HeightKey, blocks: usize) {
+        if self.key != Some(key) {
+            self.key = Some(key);
+            self.heights.clear();
+        }
+        if self.heights.len() > blocks {
+            self.heights.truncate(blocks);
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> f32 {
+        self.heights.get(i).copied().filter(|h| *h > 0.0).unwrap_or(UNMEASURED_H)
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize, h: f32) {
+        if h > 0.0 {
+            if i >= self.heights.len() {
+                self.heights.resize(i + 1, UNMEASURED_H);
+            }
+            self.heights[i] = h;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Image cache (local images decoded once, spec F28) with LRU + memory budget
 // ---------------------------------------------------------------------------
 
 pub struct ImageCache {
-    map: HashMap<PathBuf, egui::TextureHandle>,
+    map: HashMap<PathBuf, CachedImage>,
+    access_order: Vec<PathBuf>, // LRU: front = oldest, back = newest
+    current_bytes: usize,
+    max_bytes: usize,
+}
+
+struct CachedImage {
+    texture: egui::TextureHandle,
+    size_bytes: usize,
 }
 
 impl Default for ImageCache {
     fn default() -> Self {
-        Self { map: HashMap::new() }
+        // 48 MiB budget for decoded images
+        Self {
+            map: HashMap::new(),
+            access_order: Vec::new(),
+            current_bytes: 0,
+            max_bytes: 48 * 1024 * 1024,
+        }
     }
 }
 
 impl ImageCache {
     pub fn clear(&mut self) {
         self.map.clear();
+        self.access_order.clear();
+        self.current_bytes = 0;
     }
 
-    fn texture(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
-        if let Some(t) = self.map.get(path) {
-            return Some(t.clone());
+    fn touch(&mut self, path: &PathBuf) {
+        // Move to back (most recently used)
+        if let Some(pos) = self.access_order.iter().position(|p| p == path) {
+            self.access_order.remove(pos);
+            self.access_order.push(path.clone());
         }
+    }
+
+    fn evict_lru(&mut self) {
+        while self.current_bytes > self.max_bytes && !self.access_order.is_empty() {
+            let lru = self.access_order.remove(0);
+            if let Some(cached) = self.map.remove(&lru) {
+                self.current_bytes = self.current_bytes.saturating_sub(cached.size_bytes);
+            }
+        }
+    }
+
+fn texture(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+        let path_buf = path.to_path_buf();
+        // Check if cached first (immutable borrow)
+        let cached_exists = self.map.contains_key(&path_buf);
+        if cached_exists {
+            self.touch(&path_buf);
+            if let Some(cached) = self.map.get(&path_buf) {
+                return Some(cached.texture.clone());
+            }
+        }
+        // Decode and insert (mutable borrow)
         let decoded = (|| -> Result<egui::TextureHandle, image::ImageError> {
             let img = image::open(path)?;
             let img = clamp_dimensions(img);
             let rgba = img.to_rgba8();
             let (w, h) = (rgba.width(), rgba.height());
+            let _size_bytes = (w as usize) * (h as usize) * 4;
             let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
             Ok(ctx.load_texture(format!("img-{}", path.display()), color, egui::TextureOptions::LINEAR))
         })();
         match decoded {
             Ok(t) => {
-                self.map.insert(path.to_owned(), t.clone());
+                let size_bytes = t.size()[0] * t.size()[1] * 4;
+                self.map.insert(path_buf.clone(), CachedImage { texture: t.clone(), size_bytes });
+                self.access_order.push(path_buf);
+                self.current_bytes += size_bytes;
+                self.evict_lru();
                 Some(t)
             }
             Err(_) => None,
@@ -80,14 +181,53 @@ fn clamp_dimensions(img: image::DynamicImage) -> image::DynamicImage {
 }
 
 // ---------------------------------------------------------------------------
-// Syntax highlighting (syntect, spec F21)
+// Syntax highlighting (syntect, spec F21) - LAZY INITIALIZATION
 // ---------------------------------------------------------------------------
 
 static SYNTAXES: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
 static THEMES: OnceLock<syntect::highlighting::ThemeSet> = OnceLock::new();
+/// `lowercased token -> syntax` index, so a visible code block resolves its
+/// grammar in O(1) instead of rescanning all bundled syntaxes on every frame.
+static SYNTAX_INDEX: OnceLock<HashMap<String, syntect::parsing::SyntaxReference>> = OnceLock::new();
 
+/// Initialize syntect only when first needed (lazy — keeps startup fast).
+/// The full default set is used to guarantee complete language compatibility.
+fn ensure_syntect() {
+    SYNTAXES.get_or_init(syntect::parsing::SyntaxSet::load_defaults_newlines);
+    THEMES.get_or_init(syntect::highlighting::ThemeSet::load_defaults);
+}
+
+/// Resolve a fenced-code language label to a syntax definition.
+fn find_syntax(lang: &str) -> Option<syntect::parsing::SyntaxReference> {
+    if lang.is_empty() {
+        return None;
+    }
+    let key = lang.to_ascii_lowercase();
+    if let Some(hit) = SYNTAX_INDEX
+        .get_or_init(|| {
+            let mut map = HashMap::new();
+            if let Some(set) = SYNTAXES.get() {
+                for syntax in set.syntaxes() {
+                    let tokens = syntax.file_extensions.iter().chain(std::iter::once(&syntax.name));
+                    for token in tokens {
+                        map.entry(token.to_ascii_lowercase()).or_insert_with(|| syntax.clone());
+                    }
+                }
+            }
+            map
+        })
+        .get(&key)
+    {
+        return Some(hit.clone());
+    }
+    // Not an exact token: keep the original fuzzy lookup as a fallback so
+    // exotic labels resolve exactly as before.
+    let set = SYNTAXES.get()?;
+    set.find_syntax_by_token(lang).or_else(|| set.find_syntax_by_name(lang)).cloned()
+}
 fn syntect_theme(dark: bool) -> &'static syntect::highlighting::Theme {
-    let ts = THEMES.get_or_init(syntect::highlighting::ThemeSet::load_defaults);
+    ensure_syntect();
+    let ts = THEMES.get().unwrap();
     let name = if dark { "base16-ocean.dark" } else { "InspiredGitHub" };
     ts.themes.get(name).unwrap_or(&ts.themes["base16-ocean.dark"])
 }
@@ -95,39 +235,175 @@ fn syntect_theme(dark: bool) -> &'static syntect::highlighting::Theme {
 fn style_from_syn(c: syntect::highlighting::Color) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
 }
+// ---------------------------------------------------------------------------
+// Highlight cache - syntax highlighting per visible code block, once
+// ---------------------------------------------------------------------------
 
-fn code_job(code: &str, lang: &str, pal: &Palette, font_size: f32) -> LayoutJob {
+/// One resolved `(color, text)` run of a highlighted code block.
+type Run = (Color32, String);
+
+/// Identity of a highlight result: it depends on the code text, the language,
+/// the active theme and the font size. `len` guards against a 64-bit hash
+/// collision between two blocks of equal size.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+struct HlKey {
+    hash: u64,
+    len: u32,
+    lang_hash: u64,
+    font_bits: u32,
+    dark: bool,
+}
+
+/// Bounded LRU of syntax-highlight results, keyed by content hash. Keeps
+/// highlight cost proportional to distinct code blocks, not to frames.
+pub struct HighlightCache {
+    map: HashMap<HlKey, std::rc::Rc<Vec<Run>>>,
+    order: Vec<HlKey>, // front = oldest
+    max_entries: usize,
+}
+
+impl Default for HighlightCache {
+    fn default() -> Self {
+        Self { map: HashMap::new(), order: Vec::new(), max_entries: 256 }
+    }
+}
+
+#[inline]
+fn hash_bytes(seed: u64, bytes: &[u8]) -> u64 {
+    let mut h = seed ^ 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+impl HighlightCache {
+    #[inline]
+    fn key(code: &str, lang: &str, dark: bool, font_size: f32) -> HlKey {
+        HlKey {
+            hash: hash_bytes(0x9e37_79b9, code.as_bytes()),
+            len: code.len() as u32,
+            lang_hash: hash_bytes(0, lang.as_bytes()),
+            font_bits: font_size.to_bits(),
+            dark,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    fn get(&mut self, key: &HlKey) -> Option<std::rc::Rc<Vec<Run>>> {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            let k = self.order.remove(pos);
+            self.order.push(k);
+            return self.map.get(&k).cloned();
+        }
+        None
+    }
+
+    fn insert(&mut self, key: HlKey, runs: Vec<Run>) {
+        if !self.map.contains_key(&key) {
+            if self.map.len() >= self.max_entries {
+                // Drop the oldest quarter in one pass, not one entry per insert.
+                let drop_n = (self.max_entries / 4).max(1).min(self.order.len());
+                for k in self.order.drain(..drop_n).collect::<Vec<_>>() {
+                    self.map.remove(&k);
+                }
+            }
+            self.order.push(key);
+        }
+        self.map.insert(key, std::rc::Rc::new(runs));
+    }
+}
+
+#[cfg(test)]
+mod hl_cache_tests {
+    use super::*;
+
+    fn k(code: &str) -> HlKey {
+        HighlightCache::key(code, "rust", true, 14.0)
+    }
+
+    #[test]
+    fn highlight_key_distinguishes_every_input() {
+        let base = k("fn main() {}");
+        assert_ne!(base, k("fn main() { }"));
+        assert_eq!(base, k("fn main() {}"));
+        assert_ne!(base, HighlightCache::key("fn main() {}", "python", true, 14.0));
+        assert_ne!(base, HighlightCache::key("fn main() {}", "rust", false, 14.0));
+        assert_ne!(base, HighlightCache::key("fn main() {}", "rust", true, 15.0));
+    }
+
+    #[test]
+    fn highlight_cache_round_trips_and_stays_bounded() {
+        let mut c = HighlightCache::default();
+        c.max_entries = 4;
+        let key = k("x");
+        c.insert(key, vec![(Color32::RED, "x".to_owned())]);
+        assert_eq!(c.get(&key).unwrap().len(), 1);
+        assert!(c.get(&k("y")).is_none(), "different content must miss");
+
+        for i in 0..16 {
+            c.insert(k(&format!("block {i}")), vec![(Color32::RED, "z".to_owned())]);
+        }
+        assert!(c.map.len() <= 4, "cache must stay bounded, got {}", c.map.len());
+    }
+}
+
+pub fn code_job_cached(
+    code: &str,
+    lang: &str,
+    pal: &Palette,
+    font_size: f32,
+    cache: &mut HighlightCache,
+) -> LayoutJob {
     use syntect::easy::HighlightLines;
     let mut job = LayoutJob::default();
     job.break_on_newline = true;
     let mono = FontId::monospace(font_size);
-    let syntaxes = SYNTAXES.get_or_init(syntect::parsing::SyntaxSet::load_defaults_newlines);
-    let syntax = if lang.is_empty() {
-        None
-    } else {
-        syntaxes.find_syntax_by_token(lang).or_else(|| syntaxes.find_syntax_by_name(lang))
-    };
+    ensure_syntect();
+    let syntaxes = SYNTAXES.get().unwrap();
+    let syntax = find_syntax(lang);
     let Some(syntax) = syntax else {
         let fmt = TextFormat { font_id: mono, color: pal.code_text, ..Default::default() };
         job.append(code, 0.0, fmt);
         return job;
     };
-    let theme = syntect_theme(pal.dark);
-    let mut hl = HighlightLines::new(syntax, theme);
-    for line in syntect::util::LinesWithEndings::from(code) {
-        if let Ok(ranges) = hl.highlight_line(line, syntaxes) {
-            for (style, text) in ranges {
-                let mut c = style_from_syn(style.foreground);
-                if c == Color32::TRANSPARENT {
-                    c = pal.code_text;
+
+    // Highlighting is the expensive part; the resolved runs are cached so a
+    // block is only highlighted when its content, language, theme or size
+    // actually changes - not on every frame it stays on screen.
+    let key = HighlightCache::key(code, lang, pal.dark, font_size);
+    let runs = match cache.get(&key) {
+        Some(hit) => hit,
+        None => {
+            let theme = syntect_theme(pal.dark);
+            let mut hl = HighlightLines::new(&syntax, theme);
+            let mut runs: Vec<Run> = Vec::with_capacity(code.len() / 8 + 8);
+            for line in syntect::util::LinesWithEndings::from(code) {
+                if let Ok(ranges) = hl.highlight_line(line, syntaxes) {
+                    for (style, text) in ranges {
+                        let mut c = style_from_syn(style.foreground);
+                        if c == Color32::TRANSPARENT {
+                            c = pal.code_text;
+                        }
+                        runs.push((c, text.to_owned()));
+                    }
+                } else {
+                    runs.push((pal.code_text, line.to_owned()));
                 }
-                let fmt = TextFormat { font_id: mono.clone(), color: c, ..Default::default() };
-                job.append(text, 0.0, fmt);
             }
-        } else {
-            let fmt = TextFormat { font_id: mono.clone(), color: pal.code_text, ..Default::default() };
-            job.append(line, 0.0, fmt);
+            cache.insert(key, runs);
+            cache.get(&key).expect("just inserted")
         }
+    };
+
+    for (color, text) in runs.iter() {
+        let fmt = TextFormat { font_id: mono.clone(), color: *color, ..Default::default() };
+        job.append(text, 0.0, fmt);
     }
     job
 }
@@ -255,15 +531,78 @@ fn label_rich(ui: &mut egui::Ui, job: &LayoutJob, links: LinkHits, pal: &Palette
 // Public renderer
 // ---------------------------------------------------------------------------
 
-/// Render a parsed document; interaction commands are collected and returned.
-pub fn render(ui: &mut egui::Ui, doc: &Doc, pal: &Palette, base_dir: Option<&Path>, images: &mut ImageCache) -> Vec<Cmd> {
+// Render a parsed document; interaction commands are collected and returned.
+//
+// Only blocks intersecting the viewport (plus an overscan margin) are laid out.
+// Off-screen blocks contribute nothing but their cached height, so a document
+// with 100k blocks costs the same per frame as one with 10. `heights` carries
+// the per-block height table across frames.
+pub fn render(
+    ui: &mut egui::Ui,
+    doc: &Doc,
+    pal: &Palette,
+    base_dir: Option<&Path>,
+    images: &mut ImageCache,
+    doc_key: (u64, u64),
+    heights: &mut BlockHeights,
+    hl_cache: &mut HighlightCache,
+) -> Vec<Cmd> {
     let mut cmds = Vec::new();
     let base = base_font_size(ui);
-    for (i, block) in doc.blocks.iter().enumerate() {
+    let key = HeightKey {
+        buffer: doc_key.0,
+        revision: doc_key.1,
+        width_px: ui.available_width().round().max(1.0) as u32,
+        base_font_bits: base.to_bits(),
+    };
+    heights.begin(key, doc.blocks.len());
+
+    // Viewport band expressed in content coordinates (0 = top of the preview).
+    let clip = ui.clip_rect();
+    let origin_y = ui.min_rect().top();
+    let view_top = clip.min.y - origin_y;
+    let view_bot = clip.max.y - origin_y;
+
+    let n = doc.blocks.len();
+    let mut i = 0usize;
+    let mut y = 0.0f32;
+    let mut skipped = 0.0f32;
+    let mut tail = 0.0f32;
+    let mut started = false;
+
+    while i < n {
+        if !started {
+            if y + heights.get(i) < view_top - OVERSCAN_PX {
+                // Entirely above the viewport: contribute only its height.
+                y += heights.get(i);
+                skipped += heights.get(i);
+                i += 1;
+                continue;
+            }
+            ui.add_space(skipped);
+            started = true;
+        } else if y > view_bot + OVERSCAN_PX {
+            // Entirely below: fold the remainder into trailing space so the
+            // scroll extent still covers the whole document.
+            let mut t = y;
+            while i < n {
+                t += heights.get(i);
+                i += 1;
+            }
+            tail = t - y;
+            break;
+        }
+
+        let y_before = ui.cursor().min.y;
         ui.push_id(("doc_block", i), |ui| {
-            render_block(ui, block, pal, base, base_dir, images, &mut cmds);
+render_block(ui, &doc.blocks[i], pal, base, base_dir, images, hl_cache, &mut cmds);
         });
+        let measured = ui.cursor().min.y - y_before;
+        heights.set(i, measured);
+        y += measured;
+        i += 1;
     }
+    ui.add_space(tail);
     // Footnotes (spec F23 basics).
     if !doc.footnotes.is_empty() {
         ui.add_space(8.0);
@@ -278,7 +617,7 @@ pub fn render(ui: &mut egui::Ui, doc: &Doc, pal: &Palette, base_dir: Option<&Pat
                 );
                 for (bi, b) in blocks.iter().enumerate() {
                     ui.push_id(("fn_block", bi), |ui| {
-                        render_block(ui, b, pal, base * 0.92, base_dir, images, &mut cmds);
+render_block(ui, b, pal, base * 0.92, base_dir, images, hl_cache, &mut cmds);
                     });
                 }
             });
@@ -304,6 +643,7 @@ fn render_block(
     base: f32,
     base_dir: Option<&Path>,
     images: &mut ImageCache,
+    hl_cache: &mut HighlightCache,
     cmds: &mut Vec<Cmd>,
 ) {
     match block {
@@ -355,13 +695,13 @@ fn render_block(
             }
         }
         Block::BlockQuote { kind, items } => {
-            render_blockquote(ui, items, kind, pal, base, base_dir, images, cmds);
+            render_blockquote(ui, items, kind, pal, base, base_dir, images, hl_cache, cmds);
         }
         Block::List { ordered, items } => {
-            render_list(ui, *ordered, items, pal, base, 0, base_dir, images, cmds);
+            render_list(ui, *ordered, items, pal, base, 0, base_dir, images, hl_cache, cmds);
         }
         Block::CodeBlock { lang, code } => {
-            render_code(ui, code, lang, pal, base, cmds);
+            render_code(ui, code, lang, pal, base, hl_cache, cmds);
         }
         Block::Table(table) => {
             render_table(ui, table, pal, base, cmds);
@@ -379,7 +719,7 @@ fn render_block(
             ui.vertical_centered(|ui| {
                 for (i, it) in items.iter().enumerate() {
                     ui.push_id(("center_block", i), |ui| {
-                        render_block(ui, it, pal, base, base_dir, images, cmds);
+render_block(ui, it, pal, base, base_dir, images, hl_cache, cmds);
                     });
                 }
             });
@@ -396,6 +736,7 @@ fn render_blockquote(
     base: f32,
     base_dir: Option<&Path>,
     images: &mut ImageCache,
+    hl_cache: &mut HighlightCache,
     cmds: &mut Vec<Cmd>,
 ) {
     let fill = match kind {
@@ -417,7 +758,7 @@ fn render_blockquote(
                 QuoteKind::Caution => pal.danger,
                 QuoteKind::Plain => pal.faint,
             };
-ui.label(egui::RichText::new(label).strong().color(accent).size(base * 0.78));
+            ui.label(egui::RichText::new(label).strong().color(accent).size(base * 0.78));
             ui.add_space(2.0);
         }
         ui.horizontal(|ui| {
@@ -429,7 +770,7 @@ ui.label(egui::RichText::new(label).strong().color(accent).size(base * 0.78));
                 ui.set_max_width((ui.available_width() - 4.0).max(80.0));
                 for (i, b) in items.iter().enumerate() {
                     ui.push_id(("quote_block", i), |ui| {
-                        render_block(ui, b, pal, base, base_dir, images, cmds);
+                        render_block(ui, b, pal, base, base_dir, images, hl_cache, cmds);
                     });
                 }
             });
@@ -452,6 +793,7 @@ fn render_list(
     depth: usize,
     base_dir: Option<&Path>,
     images: &mut ImageCache,
+    hl_cache: &mut HighlightCache,
     cmds: &mut Vec<Cmd>,
 ) {
     let row_h = ui.text_style_height(&egui::TextStyle::Body);
@@ -485,7 +827,7 @@ fn render_list(
                     ui.set_max_width((ui.available_width() - marker_w).max(80.0));
                     for (bi, b) in item.blocks.iter().enumerate() {
                         ui.push_id(("item_block", bi), |ui| {
-                            render_block(ui, b, pal, base, base_dir, images, cmds);
+                            render_block(ui, b, pal, base, base_dir, images, hl_cache, cmds);
                         });
                     }
                 });
@@ -494,9 +836,17 @@ fn render_list(
     }
 }
 
-fn render_code(ui: &mut egui::Ui, code: &str, lang: &str, pal: &Palette, base: f32, cmds: &mut Vec<Cmd>) {
+fn render_code(
+    ui: &mut egui::Ui,
+    code: &str,
+    lang: &str,
+    pal: &Palette,
+    base: f32,
+    hl_cache: &mut HighlightCache,
+    cmds: &mut Vec<Cmd>,
+) {
     let font_size = base * 0.92;
-    let job = code_job(code, lang, pal, font_size);
+    let job = code_job_cached(code, lang, pal, font_size, hl_cache);
     let frame = Frame::new()
         .fill(pal.code_fence_bg)
         .corner_radius(8.0)
@@ -725,7 +1075,7 @@ mod tests {
             Span::Text { text: "bold".to_owned(), style: Style { bold: true, ..Style::default() } },
             Span::Text { text: "plain".to_owned(), style: Style::default() },
             Span::Text { text: "it".to_owned(), style: Style { italic: true, ..Style::default() } },
-Span::Code { text: "x".to_owned(), style: Style { bold: true, code: true, ..Style::default() } },
+            Span::Code { text: "x".to_owned(), style: Style { bold: true, code: true, ..Style::default() } },
         ];
         let (job, _links) = spans_to_job(&spans, &pal, 14.0, pal.text);
         assert_eq!(job.sections.len(), spans.len());
@@ -740,6 +1090,154 @@ Span::Code { text: "x".to_owned(), style: Style { bold: true, code: true, ..Styl
             "emphasis must use the dedicated italic family"
         );
         assert_eq!(job.sections[3].format.font_id.family, egui::FontFamily::Monospace, "code wins over strong");
+    }
+
+    fn key(buffer: u64, revision: u64, width_px: u32) -> HeightKey {
+        HeightKey { buffer, revision, width_px, base_font_bits: 14.0f32.to_bits() }
+    }
+
+    #[test]
+    fn height_cache_reuses_measurements_and_invalidates() {
+        let mut h = BlockHeights::default();
+
+        // Unmeasured blocks fall back to the estimate.
+        h.begin(key(1, 7, 800), 3);
+        assert_eq!(h.get(0), UNMEASURED_H);
+
+        // Same key: measurements survive into the next frame.
+        h.set(1, 55.0);
+        h.begin(key(1, 7, 800), 3);
+        assert_eq!(h.get(1), 55.0);
+
+        // New revision: everything is re-measured.
+        h.begin(key(1, 8, 800), 3);
+        assert_eq!(h.get(1), UNMEASURED_H);
+
+        // Different width (panel resize): everything is re-measured.
+        h.set(0, 40.0);
+        h.begin(key(1, 8, 640), 3);
+        assert_eq!(h.get(0), UNMEASURED_H);
+
+        // Different buffer (tab switch): everything is re-measured.
+        h.set(0, 40.0);
+        h.begin(key(2, 8, 640), 3);
+        assert_eq!(h.get(0), UNMEASURED_H);
+    }
+
+    #[test]
+    fn height_cache_truncates_when_document_shrinks() {
+        let mut h = BlockHeights::default();
+        h.begin(key(1, 7, 800), 5);
+        for i in 0..5 {
+            h.set(i, 20.0 + i as f32);
+        }
+        h.begin(key(1, 7, 800), 2);
+        assert_eq!(h.get(0), 20.0);
+        assert_eq!(h.get(1), 21.0);
+        assert_eq!(h.get(4), UNMEASURED_H, "trailing blocks past the new length are gone");
+    }
+
+    fn count_text(s: &egui::epaint::Shape) -> usize {
+        match s {
+            egui::epaint::Shape::Text(_) => 1,
+            egui::epaint::Shape::Vec(v) => v.iter().map(count_text).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Preview rendering must stay O(viewport): off-screen blocks are collapsed
+    /// into empty space instead of being laid out, while the scroll extent still
+    /// covers the whole document.
+    #[test]
+    fn preview_virtualizes_off_screen_blocks() {
+        let mut md = String::new();
+        for i in 0..400 {
+            md.push_str(&format!("Paragraph block number {}.\n\n", i));
+        }
+        let doc = crate::md::parse(&md);
+        assert_eq!(doc.blocks.len(), 400);
+        let pal = Palette::dark();
+        let mut images = ImageCache::default();
+        let mut heights = BlockHeights::default();
+        let mut cache = HighlightCache::default();
+
+        let mut content_h = 0.0f32;
+        let mut glyphs = 0usize;
+        for _ in 0..2 {
+            let ctx = egui::Context::default();
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)));
+            let out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let start = ui.cursor().min.y;
+                    let _ = render(ui, &doc, &pal, None, &mut images, (1, 0), &mut heights, &mut cache);
+                    content_h = ui.cursor().min.y - start;
+                });
+            });
+            glyphs = out.shapes.iter().map(|c| count_text(&c.shape)).sum();
+        }
+
+        // Full-document layout would need 400 text shapes; virtualization must
+        // stay far below that, with a generous margin for the overscan band.
+        assert!(glyphs > 0, "visible blocks must still be painted");
+        assert!(glyphs < 150, "expected viewport-only layout, got {glyphs} text shapes");
+        // 400 * ~26px is far taller than the test screen, so the collapsed tail
+        // must still contribute its height to the scrollable content.
+        assert!(content_h > 3000.0, "scroll extent collapsed: {content_h}px");
+    }
+
+    /// Scrolling to the end must reveal the final blocks, not the collapsed
+    /// space that stands in for them.
+    #[test]
+    fn preview_virtualization_reveals_tail_when_scrolled() {
+        let mut md = String::new();
+        for i in 0..400 {
+            md.push_str(&format!("Paragraph block number {}.\n\n", i));
+        }
+        let doc = crate::md::parse(&md);
+        let pal = Palette::dark();
+        let mut images = ImageCache::default();
+        let mut heights = BlockHeights::default();
+        let mut cache = HighlightCache::default();
+
+        fn collect(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => out.push_str(t.galley.text()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|e| collect(e, out)),
+                _ => {}
+            }
+        }
+
+        let mut joined = String::new();
+        let ctx = egui::Context::default();
+        // Two frames: the first primes the height cache, the second scrolls.
+        for offset in [0.0f32, 9500.0] {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)));
+            let out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+.vertical_scroll_offset(offset)
+                        .vertical_scroll_offset(offset)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let _ = render(ui, &doc, &pal, None, &mut images, (1, 0), &mut heights, &mut cache);
+                        });
+                });
+            });
+            if offset > 0.0 {
+                joined.clear();
+                for c in &out.shapes {
+                    collect(&c.shape, &mut joined);
+                }
+            }
+        }
+
+        assert!(
+            joined.contains("399"),
+            "the last block must be laid out once scrolled to the bottom; painted: {:?}",
+            &joined[..joined.len().min(200)]
+        );
     }
 
     #[test]
@@ -780,9 +1278,11 @@ fn two() {}
         let ctx = egui::Context::default();
         let pal = Palette::dark();
         let mut images = ImageCache::default();
+        let mut heights = BlockHeights::default();
+        let mut cache = HighlightCache::default();
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                let _ = render(ui, &doc, &pal, None, &mut images);
+                let _ = render(ui, &doc, &pal, None, &mut images, (1, 0), &mut heights, &mut cache);
             });
         });
         out.textures_delta.clear();
@@ -810,9 +1310,11 @@ fn two() {}
         let ctx = egui::Context::default();
         let pal = Palette::dark();
         let mut images = ImageCache::default();
+        let mut heights = BlockHeights::default();
+        let mut cache = HighlightCache::default();
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                let _cmds = render(ui, &doc, &pal, None, &mut images);
+                let _cmds = render(ui, &doc, &pal, None, &mut images, (1, 0), &mut heights, &mut cache);
                 assert!(!images.map.is_empty(), "Image must be loaded successfully!");
             });
         });
@@ -823,7 +1325,8 @@ fn two() {}
     fn test_code_syntax_highlighting_after_comments() {
         let code = "# comment line\nclient.focus(\"Chrome\")\nnum = 42\n";
         let pal = Palette::dark();
-        let job = code_job(code, "python", &pal, 14.0);
+        let mut cache = HighlightCache::default();
+        let job = code_job_cached(code, "python", &pal, 14.0, &mut cache);
 
         // Extract section text and colors
         let mut sections: Vec<(&str, Color32)> = Vec::new();
@@ -876,17 +1379,52 @@ fn two() {}
         let ctx = egui::Context::default();
         let pal = Palette::dark();
         let mut cmds = Vec::new();
+        let mut cache = HighlightCache::default();
         let code = "fn main() {\n    println!(\"Hello\");\n}\n";
 
         // Verify render_code executes safely without any deadlock or crash across frames
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-            render_code(ui, code, "rust", &pal, 15.0, &mut cmds);
+            render_code(ui, code, "rust", &pal, 15.0, &mut cache, &mut cmds);
         });
         out.textures_delta.clear();
 
         let mut out2 = ctx.run_ui(egui::RawInput::default(), |ui| {
-            render_code(ui, code, "rust", &pal, 15.0, &mut cmds);
+            render_code(ui, code, "rust", &pal, 15.0, &mut cache, &mut cmds);
         });
         out2.textures_delta.clear();
+    }
+
+    /// Second frame of the same code block must reuse the cached runs, and a
+    /// theme/size change must not reuse them.
+    #[test]
+    fn highlight_cache_reuses_and_invalidates_on_theme_change() {
+        let pal_dark = Palette::dark();
+        let pal_light = Palette::light();
+        let code = "# comment\nname = 42\n";
+        let mut cache = HighlightCache::default();
+
+        let first = code_job_cached(code, "python", &pal_dark, 14.0, &mut cache);
+        let second = code_job_cached(code, "python", &pal_dark, 14.0, &mut cache);
+        assert_eq!(first.sections.len(), second.sections.len());
+        for (a, b) in first.sections.iter().zip(second.sections.iter()) {
+            assert_eq!(a.byte_range, b.byte_range);
+            assert_eq!(a.format.color, b.format.color);
+            assert_eq!(a.format.color, b.format.color);
+        }
+        assert_eq!(cache.map.len(), 1, "one distinct block -> one entry");
+
+        // A different font size must not reuse the cached runs.
+        let bigger = code_job_cached(code, "python", &pal_dark, 20.0, &mut cache);
+        assert_eq!(bigger.sections.len(), first.sections.len(), "same runs, new size");
+        assert_eq!(cache.map.len(), 2);
+
+        // Switching the theme must re-highlight rather than reuse dark colors.
+        // (Run counts differ per theme, only the colors are compared.)
+        let light = code_job_cached(code, "python", &pal_light, 14.0, &mut cache);
+        assert_eq!(cache.map.len(), 3);
+        assert!(
+            light.sections.iter().zip(first.sections.iter()).any(|(a, b)| a.format.color != b.format.color),
+            "light theme must not reuse dark-theme colors"
+        );
     }
 }

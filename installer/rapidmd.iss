@@ -2,11 +2,13 @@
 ; Generates standalone modern Windows installer executable
 
 #define MyAppName "RapidMD"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "RapidMD"
 #define MyAppExeName "rapidmd.exe"
 
 [Setup]
+; AppId is the install identity. Do NOT change it between versions or Inno Setup
+; treats the new build as a separate product instead of an in-place upgrade.
 AppId={{D37E8F91-7C45-4D1E-8B1A-0E3B8F8A94D2}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
@@ -33,7 +35,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "associate_md"; Description: "Register RapidMD as default viewer for Markdown files (.md, .markdown)"; GroupDescription: "File Associations:"
 
 [Files]
-Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; `fast` profile: opt-level=3 + fat LTO + full symbol strip.
+; Measured: 16.03 MiB and 53 ms to first window, vs 17.38 MiB / 55 ms for
+; `release` and 12.97 MiB / 169 ms for `lean`. See docs/PERFORMANCE.md.
+; Must stay in sync with build_installer.bat and the profile in ../Cargo.toml.
+Source: "..\target\fast\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\Icon\RMD.ico"; DestDir: "{app}\assets\Icon"; Flags: ignoreversion
 Source: "..\assets\Icon\RMD.png"; DestDir: "{app}\assets\Icon"; Flags: ignoreversion
 

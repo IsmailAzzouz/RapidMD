@@ -14,7 +14,9 @@ pub struct Settings {
     pub recent: Vec<String>,
     #[serde(default = "default_true")]
     pub sync_scroll: bool,
-    #[serde(default = "default_true")]
+    /// FPS overlay is opt-in: when off (the default) the app never schedules a
+    /// timer-driven repaint, so a fully idle window costs zero CPU.
+    #[serde(default)]
     pub show_fps: bool,
 }
 
@@ -31,7 +33,7 @@ impl Default for Settings {
             show_line_numbers: true,
             recent: Vec::new(),
             sync_scroll: true,
-            show_fps: true,
+            show_fps: false,
         }
     }
 }

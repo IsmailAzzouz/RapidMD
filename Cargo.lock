@@ -2912,7 +2912,7 @@ dependencies = [
 
 [[package]]
 name = "rustdown-viewer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arboard",
  "dark-light",
@@ -2926,6 +2926,7 @@ dependencies = [
  "serde",
  "serde_json",
  "syntect",
+ "windows-sys 0.59.0",
  "winres",
 ]
 

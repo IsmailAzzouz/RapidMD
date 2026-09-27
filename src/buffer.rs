@@ -92,8 +92,10 @@ pub struct Buffer {
     pub path: Option<PathBuf>,
     /// Internal text — always `\n` line endings.
     pub text: String,
-    /// Snapshot of `text` at the last save/load boundary → dirty detection.
-    pub saved_text: String,
+    /// Revision counter, incremented on every mutation.
+    pub revision: u64,
+    /// Revision at last save/load boundary → dirty detection (O(1)).
+    pub saved_revision: u64,
     pub eol: Eol,
     pub encoding: Encoding,
     pub read_only: bool,
@@ -104,6 +106,22 @@ pub struct Buffer {
     pub suppress_external_change_once: bool,
     /// Optional display-name override (recovery buffers).
     pub title_override: Option<String>,
+    /// Cached O(n) statistics, valid while `stats_rev == revision`.
+    stats_rev: u64,
+    words: usize,
+    lines: usize,
+}
+
+impl Buffer {
+    /// Recompute the cached word/line counts, but only when the text changed
+    /// since the last call. O(1) per frame instead of O(document) per frame.
+    pub fn refresh_stats(&mut self) {
+        if self.stats_rev != self.revision {
+            self.words = self.text.split_whitespace().count();
+            self.lines = if self.text.is_empty() { 0 } else { self.text.bytes().filter(|&b| b == b'\n').count() + 1 };
+            self.stats_rev = self.revision;
+        }
+    }
 }
 
 impl Buffer {
@@ -112,7 +130,8 @@ impl Buffer {
             id,
             path: None,
             text: String::new(),
-            saved_text: String::new(),
+            revision: 0,
+            saved_revision: 0,
             eol: Eol::platform_default(),
             encoding: Encoding::Utf8,
             read_only: false,
@@ -120,6 +139,9 @@ impl Buffer {
             disk_stamp: None,
             suppress_external_change_once: false,
             title_override: None,
+            stats_rev: u64::MAX,
+            words: 0,
+            lines: 0,
         }
     }
 
@@ -127,12 +149,12 @@ impl Buffer {
         let eol = Eol::detect(&text);
         // Normalize to LF internally.
         let text = text.replace("\r\n", "\n");
-        let saved_text = text.clone();
         Self {
             id,
             path: Some(path.to_owned()),
             text,
-            saved_text,
+            revision: 0,
+            saved_revision: 0,
             eol,
             encoding,
             read_only,
@@ -140,6 +162,9 @@ impl Buffer {
             disk_stamp: Some(stamp),
             suppress_external_change_once: false,
             title_override: None,
+            stats_rev: u64::MAX,
+            words: 0,
+            lines: 0,
         }
     }
 
@@ -162,11 +187,17 @@ impl Buffer {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.text != self.saved_text
+        self.revision != self.saved_revision
     }
 
+    /// Cached when [`Buffer::refresh_stats`] has run for the current revision,
+    /// otherwise computed on the fly so the value is never stale.
     pub fn word_count(&self) -> usize {
-        self.text.split_whitespace().count()
+        if self.stats_rev == self.revision {
+            self.words
+        } else {
+            self.text.split_whitespace().count()
+        }
     }
 
     pub fn char_count(&self) -> usize {
@@ -175,16 +206,20 @@ impl Buffer {
 
     /// Number of lines in the buffer text.
     pub fn line_count(&self) -> usize {
-        if self.text.is_empty() {
-            0
+        if self.stats_rev == self.revision {
+            self.lines
         } else {
-            self.text.bytes().filter(|&b| b == b'\n').count() + 1
+            if self.text.is_empty() {
+                0
+            } else {
+                self.text.bytes().filter(|&b| b == b'\n').count() + 1
+            }
         }
     }
 
     /// Mark saved: called only after a successful write/load.
     pub fn mark_saved(&mut self) {
-        self.saved_text = self.text.clone();
+        self.saved_revision = self.revision;
         self.suppress_external_change_once = false;
         if let Some(path) = self.path.clone() {
             if let Ok(meta) = std::fs::metadata(&path) {
@@ -201,27 +236,21 @@ impl Buffer {
             Encoding::Utf8Bom => out.extend_from_slice(&[0xEF, 0xBB, 0xBF]),
             Encoding::Utf16Le => {
                 // Internal text is UTF-8; convert for round-trip preservation.
-                let mut u16s: Vec<u16> = Vec::new();
                 for u in self.eol.apply(&self.text).encode_utf16() {
-                    u16s.push(u);
-                }
-                for unit in u16s {
-                    out.extend_from_slice(&unit.to_le_bytes());
+                    out.extend_from_slice(&u.to_le_bytes());
                 }
                 return out;
             }
             Encoding::Utf16Be => {
-                let mut u16s: Vec<u16> = Vec::new();
                 for u in self.eol.apply(&self.text).encode_utf16() {
-                    u16s.push(u);
-                }
-                for unit in u16s {
-                    out.extend_from_slice(&unit.to_be_bytes());
+                    out.extend_from_slice(&u.to_be_bytes());
                 }
                 return out;
             }
             Encoding::Utf8 | Encoding::Lossy => {}
         }
+        // Fall-through: every non-UTF-16 encoding still writes the body, after an
+        // optional BOM prefix. Never drop this — it is the document itself.
         out.extend_from_slice(self.eol.apply(&self.text).as_bytes());
         out
     }
@@ -243,6 +272,7 @@ mod tests {
         let mut b = Buffer::untitled(1);
         assert!(!b.is_dirty());
         b.text.push_str("hi");
+        b.revision += 1;
         assert!(b.is_dirty());
         b.mark_saved();
         assert!(!b.is_dirty());
@@ -258,5 +288,84 @@ mod tests {
         let mut expected = vec![0xEF, 0xBB, 0xBF];
         expected.extend_from_slice(text.as_bytes());
         assert_eq!(b.encoded_bytes(), expected);
+    }
+
+    #[test]
+    fn stats_match_uncached_reference() {
+        let mut b = Buffer::untitled(7);
+        b.text = "alpha beta\ngamma\n\n  delta  ".to_owned();
+        // Before refresh_stats the values are still exact (computed on demand).
+        assert_eq!(b.word_count(), 4);
+        assert_eq!(b.line_count(), 4);
+
+        b.refresh_stats();
+        assert_eq!(b.word_count(), 4);
+        assert_eq!(b.line_count(), 4);
+    }
+
+    #[test]
+    fn stats_invalidate_on_revision_bump() {
+        let mut b = Buffer::untitled(7);
+        b.text = "one two three".to_owned();
+        b.revision = 1;
+        b.refresh_stats();
+        assert_eq!(b.word_count(), 3);
+        assert_eq!(b.line_count(), 1);
+
+        // Mutate + bump: a refreshed cache must never serve the old counts.
+        b.text.push_str("\nfour\nfive six");
+        b.revision = 2;
+        assert_eq!(b.word_count(), 6);
+        assert_eq!(b.line_count(), 3);
+        b.refresh_stats();
+        assert_eq!(b.word_count(), 6);
+        assert_eq!(b.line_count(), 3);
+    }
+
+    #[test]
+    fn stats_on_empty_buffer() {
+        let mut b = Buffer::untitled(1);
+        assert_eq!(b.word_count(), 0);
+        assert_eq!(b.line_count(), 0);
+        b.refresh_stats();
+        assert_eq!(b.word_count(), 0);
+        assert_eq!(b.line_count(), 0);
+    }
+
+    #[test]
+    fn utf16_roundtrip_writes_body() {
+        let text = "line1\r\nline2\r\n";
+        for (enc, le) in [(Encoding::Utf16Le, true), (Encoding::Utf16Be, false)] {
+            let b = Buffer::from_disk(1, Path::new("x.md"), text.to_owned(), enc, false, DiskStamp { len: 0, modified_millis: None });
+            let bytes = b.encoded_bytes();
+            // 14 chars after CRLF re-application -> 2 bytes each, never empty.
+            assert_eq!(bytes.len(), 28, "{enc:?} lost the document body");
+            let mut u16s: Vec<u16> = Vec::new();
+            for chunk in bytes.chunks_exact(2) {
+                let pair = [chunk[0], chunk[1]];
+                u16s.push(if le { u16::from_le_bytes(pair) } else { u16::from_be_bytes(pair) });
+            }
+            assert_eq!(String::from_utf16(&u16s).expect("valid utf16"), text);
+        }
+    }
+
+    #[test]
+    fn plain_utf8_writes_body_without_bom() {
+        let text = "hello\nworld\n";
+        let b = Buffer::from_disk(1, Path::new("x.md"), text.to_owned(), Encoding::Utf8, false, DiskStamp { len: 0, modified_millis: None });
+        assert_eq!(b.encoded_bytes(), text.as_bytes());
+    }
+
+    #[test]
+    fn refresh_stats_is_idempotent() {
+        let mut b = Buffer::untitled(1);
+        b.text = "a b c".to_owned();
+        b.revision = 1;
+        b.refresh_stats();
+        let (w, l) = (b.word_count(), b.line_count());
+        for _ in 0..5 {
+            b.refresh_stats();
+            assert_eq!((b.word_count(), b.line_count()), (w, l));
+        }
     }
 }

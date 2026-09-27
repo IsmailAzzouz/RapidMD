@@ -86,6 +86,19 @@ enum BlockCmd {
     Task,
 }
 
+/// Outcome of asking for the preview document of a buffer.
+enum PreviewState {
+    Ready(Arc<md::Doc>),
+    /// A newer parse is pending; the previous document is still being shown.
+    Stale(Arc<md::Doc>),
+    /// Parse is running on a worker thread.
+    Busy,
+    TooLarge,
+}
+
+/// How long typing must pause before a new preview parse is started (ms).
+const PREVIEW_DEBOUNCE_MS: u128 = 120;
+
 pub struct App {
     buffers: Vec<Buffer>,
     active: Option<usize>,
@@ -95,10 +108,22 @@ pub struct App {
     palette: Palette,
     find: Finder,
     find_matches: Vec<std::ops::Range<usize>>,
+    /// Shared handle passed to the editor layouter. Rebuilt only when the match
+    /// list actually changes, instead of cloning every match on every frame.
+    find_arc: Arc<Vec<std::ops::Range<usize>>>,
+    /// Syntax token scratch space owned by the app so the editor layouter
+    /// reuses one allocation across all frames and all buffers.
+    editor_job_scratch: editor::JobScratch,
+    /// Retains the built `LayoutJob` so a repaint with no edit is a clone, not
+    /// a full re-tokenize-and-append pass over the whole document.
+    editor_job_cache: editor::JobCache,
     modal: Option<Modal>,
     pending: Vec<Cmd>,
     toast: Option<(String, Instant)>,
     images: ImageCache,
+    /// Measured preview block heights, so only on-screen blocks are laid out.
+    preview_heights: preview::BlockHeights,
+    highlight_cache: preview::HighlightCache,
     doc_cache: Option<(u64, u64, Arc<md::Doc>)>,
     sel: Option<(usize, usize)>, // char offsets, sorted
     editor_widget: Option<egui::Id>,
@@ -119,7 +144,31 @@ pub struct App {
     fps: f32,
     icon_texture: Option<egui::TextureHandle>,
     cjk_loaded: bool,
+    /// Content fingerprint at which the CJK probe last found nothing to do.
+    /// Keeps the (O(document)) CJK scan off the per-frame path: it only runs
+    /// again once a buffer is added or some text actually changes.
+    cjk_probe: Option<u64>,
+    /// Crash-recovery items are produced on a worker thread spawned at
+    /// construction time, so the recovery directory I/O and JSON parsing never
+    /// run on the UI thread — not even on the first painted frame.
+    recovery_task: Option<std::thread::JoinHandle<Vec<(String, Option<PathBuf>, String)>>>,
+    /// Files requested on the command line; opened after the first frame so the
+    /// window is already on screen while they are still being read.
+    pending_open: Vec<PathBuf>,
+    /// In-flight background reads for `pending_open` (at most one at a time).
+    open_task: Option<(PathBuf, std::thread::JoinHandle<Result<io::ReadOutcome, io::ReadError>>)>,
+    /// In-flight background markdown parse, keyed by (buffer id, revision) so a
+    /// result is only ever consumed for the exact text it was produced from.
+    preview_task: Option<(u64, u64, std::thread::JoinHandle<Arc<md::Doc>>)>,
+    /// Content fingerprint of the last crash-recovery snapshot, and when it was
+    /// written. Together they stop the autosave from rewriting every dirty
+    /// document on every single frame.
+    recovery_written: Option<u64>,
+    recovery_last_write: Option<Instant>,
 }
+
+/// Minimum seconds between two crash-recovery snapshots.
+const RECOVERY_INTERVAL: f32 = 5.0;
 
 fn menu_separator(ui: &mut egui::Ui, pal: &Palette) {
     ui.add_space(3.0);
@@ -233,10 +282,15 @@ impl App {
             palette,
             find: Finder::default(),
             find_matches: Vec::new(),
+            find_arc: Arc::new(Vec::new()),
+            editor_job_scratch: editor::JobScratch::default(),
+            editor_job_cache: editor::JobCache::default(),
             modal: None,
             pending: Vec::new(),
             toast: None,
             images: ImageCache::default(),
+            preview_heights: preview::BlockHeights::default(),
+            highlight_cache: preview::HighlightCache::default(),
             doc_cache: None,
             sel: None,
             editor_widget: None,
@@ -257,19 +311,23 @@ impl App {
             fps: 60.0,
             icon_texture: None,
             cjk_loaded: false,
+            cjk_probe: None,
+            recovery_task: Some(std::thread::spawn(scan_recovery)),
+            pending_open: Vec::new(),
+            open_task: None,
+            preview_task: None,
+            recovery_written: None,
+            recovery_last_write: None,
         };
         for arg in std::env::args().skip(1) {
             let p = PathBuf::from(&arg);
             if p.is_file() {
-                app.open_path(&p, true);
+                // Deferred: read on a worker thread once the window is up.
+                app.pending_open.push(p);
             }
         }
         if !app.cjk_loaded {
             app.ensure_cjk_if_needed(&cc.egui_ctx);
-        }
-        let items = scan_recovery();
-        if !items.is_empty() {
-            app.modal = Some(Modal::Recovery { items });
         }
         app
     }
@@ -300,8 +358,8 @@ impl App {
         self.active.and_then(|i| self.buffers.get(i))
     }
 
-    fn act_text(&self) -> Option<String> {
-        self.current().map(|b| b.text.clone())
+    fn act_text(&self) -> Option<&str> {
+        self.current().map(|b| b.text.as_str())
     }
 
     fn sel_bytes(&self) -> std::ops::Range<usize> {
@@ -309,7 +367,7 @@ impl App {
         match self.sel {
             Some((a, b)) => {
                 let (lo, hi) = (a.min(b), a.max(b));
-                char_to_byte(&t, lo.min(t.chars().count()))..char_to_byte(&t, hi.min(t.chars().count()))
+                char_to_byte(t, lo.min(t.chars().count()))..char_to_byte(t, hi.min(t.chars().count()))
             }
             None => t.len()..t.len(),
         }
@@ -391,19 +449,25 @@ impl App {
         }
         match io::read_file(path) {
             Ok(out) => {
-                let id = self.next_id;
-                self.next_id += 1;
-                let mut b = Buffer::from_disk(id, path, out.text, out.encoding, out.read_only, out.stamp);
-                if b.encoding == Encoding::Lossy {
-                    b.title_override = Some(format!("{} (repaired)", b.title()));
-                }
-                self.buffers.push(b);
-                self.active = Some(self.buffers.len() - 1);
-                self.settings.push_recent(path);
-                self.invalidate_preview();
+                self.adopt_read(path, out);
             }
             Err(e) => self.toast = Some((format!("Cannot open {}: {}", path.display(), e), Instant::now())),
         }
+    }
+
+    /// Turn an already-read file into a new active buffer. Shared by the
+    /// synchronous file dialog path and the deferred command-line path.
+    fn adopt_read(&mut self, path: &Path, out: io::ReadOutcome) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut b = Buffer::from_disk(id, path, out.text, out.encoding, out.read_only, out.stamp);
+        if b.encoding == Encoding::Lossy {
+            b.title_override = Some(format!("{} (repaired)", b.title()));
+        }
+        self.buffers.push(b);
+        self.active = Some(self.buffers.len() - 1);
+        self.settings.push_recent(path);
+        self.invalidate_preview();
     }
 
     fn pick_open(&mut self) {
@@ -422,7 +486,8 @@ impl App {
         if let Ok(out) = io::read_file(&path) {
             let b = &mut self.buffers[idx];
             b.text = out.text.replace("\r\n", "\n");
-            b.saved_text = b.text.clone();
+            b.revision = 0;
+            b.saved_revision = 0;
             b.encoding = out.encoding;
             b.read_only = out.read_only;
             b.disk_stamp = Some(out.stamp);
@@ -436,14 +501,64 @@ impl App {
 
     fn invalidate_preview(&mut self) {
         self.doc_cache = None;
+        self.preview_task = None;
     }
 
-    /// Programmatic text edit with a single native undo step (spec §8.6).
+    /// Parsed-document lookup for the preview pane. The markdown parse itself
+    /// runs on a worker thread, so a large document never stalls the UI; the
+    /// result is cached by (buffer id, revision) and reused for every frame
+    /// until the text changes again.
+    fn preview_doc(&mut self, ui: &egui::Ui, idx: usize) -> PreviewState {
+        let (id, rev) = (self.buffers[idx].id, self.buffers[idx].revision);
+        let previous = self.doc_cache.clone();
+        if let Some((cid, crev, d)) = previous.clone() {
+            if cid == id && crev == rev {
+                return PreviewState::Ready(d);
+            }
+        }
+        // Debounce: while the user is actively typing, keep showing the last
+        // parsed document instead of spawning a parse per keystroke.
+        if self.last_edit.elapsed().as_millis() < PREVIEW_DEBOUNCE_MS {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(PREVIEW_DEBOUNCE_MS as u64));
+            return match previous {
+                Some((_, _, d)) => PreviewState::Stale(d),
+                None => PreviewState::Busy,
+            };
+        }
+        let in_flight = matches!(&self.preview_task, Some((cid, crev, _)) if *cid == id && *crev == rev);
+        if !in_flight {
+            // The size guard is only evaluated when a parse actually starts,
+            // never once per frame.
+            if self.buffers[idx].text.chars().count() > 4_000_000 {
+                return PreviewState::TooLarge;
+            }
+            let text = self.buffers[idx].text.clone();
+            self.preview_task = Some((id, rev, std::thread::spawn(move || Arc::new(md::parse(&text)))));
+        }
+        if let Some((cid, crev, handle)) = self.preview_task.as_ref() {
+            if *cid == id && *crev == rev && handle.is_finished() {
+                let (_, _, handle) = self.preview_task.take().expect("checked above");
+                if let Ok(d) = handle.join() {
+                    self.doc_cache = Some((id, rev, d.clone()));
+                    return PreviewState::Ready(d);
+                }
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(10));
+            }
+        }
+        match previous {
+            Some((_, _, d)) => PreviewState::Stale(d),
+            None => PreviewState::Busy,
+        }
+    }
+
+/// Programmatic text edit with a single native undo step (spec §8.6).
     fn set_text(&mut self, new_text: String, new_sel: Option<std::ops::Range<usize>>) {
         let Some(idx) = self.active else { return };
         let before = self.buffers[idx].text.clone();
         push_undo_snapshot(self.ctx_handle.as_ref(), self.editor_widget, self.sel, &before);
         self.buffers[idx].text = new_text;
+        self.buffers[idx].revision += 1;
         self.invalidate_preview();
         self.focus_editor = true;
         if let Some(sel) = new_sel {
@@ -510,9 +625,10 @@ impl App {
             Some(t) => self.find.matches(&t),
             None => Vec::new(),
         };
+        self.find_arc = Arc::new(self.find_matches.clone());
     }
 
-    fn find_goto(&mut self, next: bool) {
+fn find_goto(&mut self, next: bool) {
         let Some(t) = self.act_text() else { return };
         if self.find_matches.is_empty() {
             self.find_refresh();
@@ -529,7 +645,7 @@ impl App {
         };
         if let Some(m) = m {
             let idx = self.active.unwrap();
-            self.set_text(t, Some(m.clone()));
+            self.set_text(t.to_string(), Some(m.clone()));
             let _ = idx;
         }
     }
@@ -633,10 +749,25 @@ impl App {
         if self.cjk_loaded {
             return;
         }
-        let needs = self.buffers.iter().any(|b| text_has_cjk(&b.text));
-        if needs {
+        // O(number of buffers), not O(document text): the expensive probe only
+        // reruns when the content fingerprint actually changed.
+        let fingerprint = self.content_fingerprint();
+        if self.cjk_probe == Some(fingerprint) {
+            return;
+        }
+        self.cjk_probe = Some(fingerprint);
+        if self.buffers.iter().any(|b| text_has_cjk(&b.text)) {
             self.load_cjk_fonts(ctx);
         }
+    }
+
+    /// Cheap change detector over all buffers (count + per-buffer revisions).
+    fn content_fingerprint(&self) -> u64 {
+        let mut h = self.buffers.len() as u64;
+        for b in &self.buffers {
+            h = h.wrapping_mul(31).wrapping_add(b.revision);
+        }
+        h
     }
 
     fn load_cjk_fonts(&mut self, ctx: &egui::Context) {
@@ -838,8 +969,54 @@ impl App {
         self.ctx_handle = Some(ctx.clone());
         self.handle_keys(&ctx);
 
+        // Crash recovery is scanned on a worker thread (see `recovery_task`), so
+        // this only joins an already-finished thread and never blocks on I/O.
+        if let Some(handle) = self.recovery_task.as_ref() {
+            if handle.is_finished() {
+                let items = self.recovery_task.take().and_then(|h| h.join().ok()).unwrap_or_default();
+                if !items.is_empty() {
+                    self.modal = Some(Modal::Recovery { items });
+                }
+            } else {
+                // Poll cheaply while the scan is still running.
+                ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            }
+        }
+
+        // Command-line files are read on a worker thread, one at a time, so the
+        // first paint is never blocked by a large document.
+        if self.open_task.is_none() {
+            if let Some(path) = self.pending_open.first().cloned() {
+                self.open_task = Some((path.clone(), std::thread::spawn(move || io::read_file(&path))));
+            }
+        }
+        if let Some((_, handle)) = self.open_task.as_ref() {
+            if handle.is_finished() {
+                let (path, handle) = self.open_task.take().expect("open_task checked");
+                match handle.join() {
+                    Ok(Ok(out)) => self.adopt_read(&path, out),
+                    Ok(Err(e)) => {
+                        self.toast = Some((format!("Cannot open {}: {}", path.display(), e), Instant::now()));
+                    }
+                    Err(_) => {}
+                }
+                self.pending_open.retain(|p| *p != path);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(10));
+            }
+        }
+
         if !self.cjk_loaded {
             self.ensure_cjk_if_needed(&ctx);
+        }
+
+        // Word/line counts are O(document) to compute; refresh the cache for the
+        // active buffer only when its revision moved so the status bar and the
+        // line-number gutter stop rescanning the text on every frame.
+        if let Some(idx) = self.active {
+            if let Some(b) = self.buffers.get_mut(idx) {
+                b.refresh_stats();
+            }
         }
 
         let now = Instant::now();
@@ -900,7 +1077,9 @@ impl App {
             self.open_path(&p, true);
         }
 
-        self.recovery_tick();
+        if self.recovery_tick() {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(RECOVERY_INTERVAL));
+        }
 
         let modal = self.modal.take();
 
@@ -974,10 +1153,27 @@ impl App {
         }
     }
 
-    fn recovery_tick(&mut self) {
-        if self.last_edit.elapsed().as_secs() < 2 || self.dirty_list().is_empty() {
-            return;
+    /// Crash-recovery autosave (spec F68/F91). Change-gated and throttled: at
+    /// most one snapshot per `RECOVERY_INTERVAL`, and only when a dirty buffer
+    /// actually changed since the previous snapshot. Returns true while a
+    /// snapshot is still outstanding (so the caller can schedule a wake-up).
+    fn recovery_tick(&mut self) -> bool {
+        if self.last_edit.elapsed().as_secs() < 2 {
+            return self.buffers.iter().any(|b| b.is_dirty());
         }
+        if self.buffers.iter().all(|b| !b.is_dirty()) {
+            self.recovery_written = None;
+            return false;
+        }
+        let fingerprint = self.content_fingerprint();
+        if self.recovery_written == Some(fingerprint) {
+            return false;
+        }
+        if self.recovery_last_write.is_some_and(|t| t.elapsed().as_secs_f32() < RECOVERY_INTERVAL) {
+            return true;
+        }
+        self.recovery_written = Some(fingerprint);
+        self.recovery_last_write = Some(Instant::now());
         let dir = recovery_dir();
         let _ = std::fs::create_dir_all(&dir);
         for (i, b) in self.buffers.iter().enumerate() {
@@ -991,6 +1187,7 @@ impl App {
             });
             let _ = std::fs::write(dir.join(format!("buf-{}.json", i)), serde_json::to_string(&v).unwrap_or_default());
         }
+        false
     }
 
     // ------------------------------------------------------------ UI pieces
@@ -1349,6 +1546,7 @@ impl App {
             if ui.add(egui::Button::new(RichText::new("✕").size(12.0).color(self.palette.faint)).frame(false)).clicked() {
                 self.find.open = false;
                 self.find_matches.clear();
+                self.find_arc = Arc::new(Vec::new());
             }
             if changed {
                 self.find_refresh();
@@ -1381,7 +1579,8 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                     ui.label(RichText::new(b.encoding.label()).color(self.palette.faint).monospace().size(11.0));
                 }
                 ui.label(RichText::new(if b.eol == crate::buffer::Eol::Crlf { "CRLF" } else { "LF" }).color(self.palette.faint).size(11.0));
-                let t = b.text.clone();
+                // Borrow the text instead of copying the whole document every frame.
+                let t: &str = &b.text;
                 let (ln, col) = match self.sel {
                     Some((a, _)) => editor::line_col(&t, char_to_byte(&t, a)),
                     None => (1, 1),
@@ -1545,20 +1744,17 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
 
     fn view_pane(&mut self, ui: &mut egui::Ui, idx: usize) {
         let base_dir = self.buffers[idx].path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let text = self.buffers[idx].text.clone();
-        let hash = fnv64(&text);
-        let doc = match self.doc_cache.clone() {
-            Some((cid, h, d)) if cid == self.buffers[idx].id && h == hash => d,
-            _ => {
-                if text.chars().count() > 4_000_000 {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("File is too large to preview. Use Edit mode.").color(self.palette.warning));
-                    });
-                    return;
-                }
-                let d = Arc::new(md::parse(&text));
-                self.doc_cache = Some((self.buffers[idx].id, hash, d.clone()));
-                d
+        let doc = match self.preview_doc(ui, idx) {
+            PreviewState::Ready(d) | PreviewState::Stale(d) => d,
+            PreviewState::TooLarge => {
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new("File is too large to preview. Use Edit mode.").color(self.palette.warning));
+                });
+                return;
+            }
+            PreviewState::Busy => {
+                ui.centered_and_justified(|ui| { ui.spinner(); });
+                return;
             }
         };
         let in_split = self.mode == Mode::Split && self.settings.sync_scroll;
@@ -1592,7 +1788,17 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                 ui.add_space(side_margin);
                 ui.vertical(|ui| {
                     ui.set_max_width(content_w);
-                    let cmds = preview::render(ui, &doc, &self.palette, base_dir.as_deref(), &mut self.images);
+                    let doc_key = (self.buffers[idx].id, self.buffers[idx].revision);
+                    let cmds = preview::render(
+                        ui,
+                        &doc,
+                        &self.palette,
+                        base_dir.as_deref(),
+                        &mut self.images,
+                        doc_key,
+                        &mut self.preview_heights,
+                        &mut self.highlight_cache,
+                    );
                     for c in cmds {
                         match c {
                             preview::Cmd::OpenUrl(u) => {
@@ -1631,8 +1837,11 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
         let pal = self.palette.clone();
         let font_size = ui.style().text_styles.get(&egui::TextStyle::Monospace).map(|f| f.size).unwrap_or(13.5);
         let font = FontId::monospace(font_size);
-        let matches = Arc::new(self.find_matches.clone());
+        // Shared handle + shared token scratch: both are owned by the app, so
+        // this frame allocates nothing for the layouter.
+        let matches = self.find_arc.clone();
         let len = self.buffers[idx].text.len();
+        let token_key = (self.buffers[idx].id, self.buffers[idx].revision);
 
         let in_split = self.mode == Mode::Split && self.settings.sync_scroll;
         if in_split {
@@ -1701,27 +1910,40 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                         }
                         let avail_w = ui.available_width();
                         let desired_w = if wrap { avail_w.max(80.0) } else { f32::INFINITY };
-                        let mut te = TextEdit::multiline(&mut self.buffers[idx].text)
-                            .font(font.clone())
-                            .desired_width(desired_w)
-                            .desired_rows(10)
-                            .margin(Margin::symmetric(12, 6));
                         let use_syntax = len < MAX_SYNTAX_CHARS;
-                        let m2 = matches.clone();
-                        let mut layouter = move |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, width: f32| {
-                            let text = buffer.as_str();
-                            let max_w = if wrap { width.min(avail_w).max(80.0) } else { f32::INFINITY };
-                            let mut job = if use_syntax {
-                                editor::editor_job(text, &pal, font.clone(), &m2)
-                            } else {
-                                egui::text::LayoutJob::simple(text.to_owned(), font.clone(), pal.text, max_w)
+                        // The token scratch space lives on the app, so the syntax
+                        // token Vec is reused across frames and buffers instead
+                        // of being reallocated on every repaint. Scoped so its
+                        // borrow ends before the app fields are updated again.
+                        let out = {
+                            let mut te = TextEdit::multiline(&mut self.buffers[idx].text)
+                                .font(font.clone())
+                                .desired_width(desired_w)
+                                .desired_rows(10)
+                                .margin(Margin::symmetric(12, 6));
+                            let m2 = matches.clone();
+                            let scratch = &mut self.editor_job_scratch;
+                            let jobcache = &mut self.editor_job_cache;
+                            let token_key = token_key;
+                            // `Arc` identity: a new find search allocates a new
+                            // `find_arc`, so this changes exactly when the match
+                            // set changes.
+                            let matches_id = Arc::as_ptr(&m2) as *const u8 as usize;
+                            let mut layouter = move |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, width: f32| {
+                                let text = buffer.as_str();
+                                let max_w = if wrap { width.min(avail_w).max(80.0) } else { f32::INFINITY };
+                                let mut job = if use_syntax {
+                                    jobcache.job(text, &pal, &font, &m2, matches_id, token_key, max_w, scratch)
+                                } else {
+                                    jobcache.plain(text, &font, pal.text, max_w, token_key)
+                                };
+                                job.wrap.max_width = max_w;
+                                job.wrap.break_anywhere = true;
+                                ui.fonts_mut(|f| f.layout_job(job))
                             };
-                            job.wrap.max_width = max_w;
-                            job.wrap.break_anywhere = true;
-                            ui.fonts_mut(|f| f.layout_job(job))
+                            te = te.layouter(&mut layouter);
+                            te.show(ui)
                         };
-                        te = te.layouter(&mut layouter);
-                        let out = te.show(ui);
                         self.editor_widget = Some(out.response.id);
                         if (is_focused && ui.input(|i| !i.events.is_empty())) || out.response.changed() {
                             self.split_scroll_driver = SplitScrollDriver::Editor;
@@ -1743,6 +1965,10 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
                             self.sel = Some((s[0].index.0, s[1].index.0));
                         }
                         if out.response.changed() {
+                            // TextEdit mutates the buffer text in place, so the
+                            // revision must be bumped here: dirty-state,
+                            // preview and highlight caches are all keyed on it.
+                            self.buffers[idx].revision += 1;
                             self.invalidate_preview();
                             self.last_edit = Instant::now();
                             if self.find.open {
@@ -1765,11 +1991,13 @@ ui.label(RichText::new(b.path_or_title()).color(self.palette.text));
     }
 
     fn toast_ui(&mut self, ctx: &egui::Context) {
-        if let Some((msg, at)) = self.toast.clone() {
-            if at.elapsed().as_secs_f32() > 5.0 {
-                self.toast = None;
-                return;
-            }
+        // Borrow rather than clone: the toast lives for 5 seconds, and copying
+        // its message on every frame is pure garbage.
+        let expired = self.toast.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs_f32() > 5.0);
+        if expired {
+            self.toast = None;
+        }
+        if let Some((msg, _)) = self.toast.as_ref() {
             egui::Area::new(egui::Id::new("toast"))
                 .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -38.0))
                 .show(ctx, |ui| {
@@ -1791,24 +2019,19 @@ impl eframe::App for App {
     }
     fn on_exit(&mut self) {
         self.settings.save();
+self.settings.save();
         clear_recovery();
     }
 }
 
-fn fnv64(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
 fn push_undo_snapshot(ctx: Option<&egui::Context>, id: Option<egui::Id>, sel: Option<(usize, usize)>, text: &str) {
-    use eframe::egui::text::{CCursor, CCursorRange};
-    let (Some(ctx), Some(id)) = (ctx, id) else { return };
+    let Some(ctx) = ctx else { return };
+    let Some(id) = id else { return };
     let (a, b) = sel.unwrap_or((0, 0));
-    let range = CCursorRange::two(CCursor::new(a.min(b)), CCursor::new(a.max(b)));
+    let range = egui::text::CCursorRange::two(
+        egui::text::CCursor::new(a.min(b)),
+        egui::text::CCursor::new(a.max(b)),
+    );
     if let Some(st) = egui::TextEdit::load_state(ctx, id) {
         st.undoer().add_undo(&(range, text.to_owned()));
         st.store(ctx, id);
@@ -1852,7 +2075,7 @@ fn load_cjk_font_data() -> Option<egui::FontData> {
     None
 }
 
-fn build_base_fonts() -> egui::FontDefinitions {
+pub fn build_base_fonts() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
 
     // Remove redundant Ubuntu font to save heap memory; Inter and JetBrains Mono are primary.
@@ -2395,7 +2618,7 @@ impl App {
                             }
                         });
                     });
-                if recover {
+if recover {
                     for (title, path, text) in items {
                         let id = self.next_id;
                         self.next_id += 1;
@@ -2403,6 +2626,8 @@ impl App {
                         b.title_override = Some(title);
                         b.path = path;
                         b.text = text;
+                        b.revision = 0;
+                        b.saved_revision = 0;
                         self.buffers.push(b);
                     }
                     if !self.buffers.is_empty() {
@@ -2455,10 +2680,15 @@ mod tests {
             palette,
             find: Finder::default(),
             find_matches: Vec::new(),
+            find_arc: Arc::new(Vec::new()),
+            editor_job_scratch: editor::JobScratch::default(),
+            editor_job_cache: editor::JobCache::default(),
             modal: None,
             pending: Vec::new(),
             toast: None,
             images: ImageCache::default(),
+            preview_heights: preview::BlockHeights::default(),
+            highlight_cache: preview::HighlightCache::default(),
             doc_cache: None,
             sel: None,
             editor_widget: None,
@@ -2479,6 +2709,13 @@ mod tests {
             fps: 60.0,
             icon_texture: None,
             cjk_loaded: false,
+            cjk_probe: None,
+            recovery_task: None,
+            pending_open: Vec::new(),
+            open_task: None,
+            preview_task: None,
+            recovery_written: None,
+            recovery_last_write: None,
         };
         app.add_untitled();
         app
@@ -2491,6 +2728,39 @@ mod tests {
         });
         out.textures_delta.clear();
         res.unwrap()
+    }
+
+    #[test]
+    fn test_typing_bumps_revision_and_marks_dirty() {
+        let ctx = egui::Context::default();
+        let mut app = create_test_app(&ctx);
+        app.buffers[0].text = "hello".to_string();
+        app.buffers[0].revision = 0;
+        app.buffers[0].saved_revision = 0;
+        assert!(!app.buffers[0].is_dirty());
+        // Frame 1: render the editor and give it focus.
+        step(&ctx, egui::RawInput::default(), |ui| {
+            app.update_impl(ui);
+            if let Some(id) = app.editor_widget {
+                ui.ctx().memory_mut(|m| m.request_focus(id));
+            }
+        });
+        // Frame 2: type one character into the focused editor.
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        raw.events.push(egui::Event::Text("a".to_owned()));
+        step(&ctx, raw, |ui| {
+            app.update_impl(ui);
+        });
+        assert_eq!(app.buffers[0].text, "helloa");
+        assert_eq!(app.buffers[0].revision, 1, "typing must bump the revision counter");
+        assert!(app.buffers[0].is_dirty(), "typed text must mark the buffer dirty");
     }
 
     #[test]
@@ -2832,15 +3102,15 @@ mod tests {
         assert!(app.modal.is_none(), "Escape must dismiss the help modal");
     }
 
-    #[test]
+#[test]
     fn test_fps_counter_toggle() {
         let ctx = egui::Context::default();
         let mut app = create_test_app(&ctx);
-        assert!(app.settings.show_fps);
-        app.apply_cmd(Cmd::ToggleFps, &ctx);
         assert!(!app.settings.show_fps);
         app.apply_cmd(Cmd::ToggleFps, &ctx);
         assert!(app.settings.show_fps);
+        app.apply_cmd(Cmd::ToggleFps, &ctx);
+        assert!(!app.settings.show_fps);
     }
 
     #[test]

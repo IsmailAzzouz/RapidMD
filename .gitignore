@@ -12,8 +12,21 @@
 Thumbs.db
 
 # Logs
-.logs/
 *.log
+
+# Benchmark baseline worktree (git worktree + its own target/ dir).
+# Recreate with the command in docs/PERFORMANCE.md; never commit it.
+.bench-baseline/
+
+# Local scratch log dir (pre-existing tool output, not project data).
+# *.log above already covers most of it; these two are not *.log.
+/.logs/
+
+# AXIS app database files that live in the workspace root.
+# Not part of RapidMD; never commit.
+axis-v2.sqlite3
+axis-v2.sqlite3-shm
+axis-v2.sqlite3-wal
 
 # Foundry IDE runtime & working sessions
 .foundry/

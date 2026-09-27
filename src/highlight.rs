@@ -29,69 +29,46 @@ pub struct Syntax {
     pub tokens: Vec<(std::ops::Range<usize>, Tk)>,
 }
 
-/// Tokenize whole markdown source.
+/// Tokenize whole markdown source into a freshly allocated [`Syntax`].
 pub fn tokenize(text: &str) -> Syntax {
-    let mut tokens: Vec<(std::ops::Range<usize>, Tk)> = Vec::new();
-    let mut in_fence = false;
-
-    let lines: Vec<(usize, usize, usize)> = {
-        let mut out = Vec::new();
-        let mut i = 0;
-        loop {
-            match text_line_bounds(text, i) {
-                Some(b) => {
-                    out.push(b);
-                    i += 1;
-                }
-                None => break,
-            }
-        }
-        out
-    };
-
-    for &(start, end, _) in &lines {
-        let line = &text[start..end];
-        if let Some((fs, fe, lang)) = fence_span(line) {
-            let _ = lang;
-            if in_fence {
-                // Closing fence.
-                tokens.push((start + fs..start + fe, Tk::Fence));
-                in_fence = false;
-                continue;
-            }
-            in_fence = true;
-            tokens.push((start + fs..start + fe, Tk::Fence));
-            continue;
-        }
-        if in_fence {
-            tokens.push((start..end, Tk::CodeText));
-            continue;
-        }
-tokenize_line(start, line, &mut tokens);
-    }
+    let mut tokens = Vec::with_capacity(text.len() / 24 + 8);
+    tokenize_into(text, &mut tokens);
     Syntax { text: text.to_owned(), tokens }
 }
 
-fn text_line_bounds(text: &str, line_idx: usize) -> Option<(usize, usize, usize)> {
+/// Tokenize markdown source, appending tokens into a caller-owned buffer.
+/// Reusing the same `Vec` across frames keeps the allocation hot, which matters
+/// because the editor layouter re-tokenizes the visible text on every repaint.
+///
+/// Single pass: lines are walked with a running byte offset, so total work is
+/// O(n) in document size (the previous `text_line_bounds` re-scan made it O(n²)).
+pub fn tokenize_into(text: &str, tokens: &mut Vec<(std::ops::Range<usize>, Tk)>) {
+    tokens.clear();
     if text.is_empty() {
-        return None;
+        return;
     }
+    let mut in_fence = false;
     let mut start = 0usize;
-    for idx in 0..=line_idx {
-        let end = match text[start..].find('\n') {
-            Some(rel) => start + rel,
-            None => text.len(),
+    while start < text.len() {
+        // Locate the end of this line (exclusive of the '\n').
+        let (end, next) = match text[start..].find('\n') {
+            Some(rel) => (start + rel, start + rel + 1),
+            None => (text.len(), text.len()),
         };
-        if idx == line_idx {
-            let end_incl = if end < text.len() { end + 1 } else { end };
-            return Some((start, end, end_incl));
+        let line = &text[start..end];
+        if let Some((fs, fe, _lang)) = fence_span(line) {
+            tokens.push((start + fs..start + fe, Tk::Fence));
+            in_fence = !in_fence;
+        } else if in_fence {
+            tokens.push((start..end, Tk::CodeText));
+        } else {
+            tokenize_line(start, line, tokens);
         }
-        if end == text.len() {
-            return None;
+        if next == start {
+            break;
         }
-        start = end + 1;
+        start = next;
     }
-    None
 }
 
 /// `(start, end, lang)` of a full-line fence (``` or ~~~).
@@ -208,7 +185,6 @@ fn heading_len(s: &str) -> Option<usize> {
 
 fn scan_inline(line_start: usize, line: &str, from: usize, tokens: &mut Vec<(std::ops::Range<usize>, Tk)>) {
     let mut i = from;
-    let chars: Vec<(usize, char)> = line.char_indices().collect();
     let mut plain_start = from;
 
     let push_plain = |tokens: &mut Vec<(std::ops::Range<usize>, Tk)>, a: usize, b: usize| {
@@ -296,7 +272,9 @@ fn scan_inline(line_start: usize, line: &str, from: usize, tokens: &mut Vec<(std
             i += 1 + line[i + 1..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
             continue;
         }
-        i += chars.iter().find(|&&(idx, _)| idx >= i).map(|&(_, c)| c.len_utf8()).unwrap_or(1);
+        // Advance exactly one UTF-8 character (no per-line index Vec, and no
+        // linear rescan — this keeps scan_inline linear in line length).
+        i += rest.chars().next().map_or(1, |c| c.len_utf8());
     }
     push_plain(tokens, plain_start, line.len());
 }
@@ -470,5 +448,65 @@ mod tests {
         // Also a lone opening backtick followed by multibyte content.
         let s2 = "`——— unfinished";
         let _ = tokenize(s2);
+    }
+
+    #[test]
+    fn tokenize_into_matches_tokenize_and_reuses_buffer() {
+        // The editor layouter takes the `tokenize_into` path with a persistent
+        // buffer; it must produce exactly the same tokens as the allocating
+        // `tokenize`, including after the buffer is reused across documents.
+        let docs = [
+            "# Title\n\nSome **bold** and *em* and `code`.\n",
+            "- [x] done\n- [ ] todo\n1. first\n",
+            "```rust\nfn main() {}\n```\n\n```\nplain\n```\n",
+            "> quoted **text**\n\n---\n\n# H1\n## H2\n",
+            "trailing line without newline",
+            "ünïcödé — ✓ 你好 [l](u)\n",
+        ];
+        let mut buf: Vec<(std::ops::Range<usize>, Tk)> = Vec::new();
+        for doc in docs {
+            let expected = tokenize(doc).tokens;
+            tokenize_into(doc, &mut buf);
+            assert_eq!(buf, expected, "tokenize_into diverged for {doc:?}");
+
+            // Reusing a dirty buffer must not leak tokens from the previous doc.
+            tokenize_into("# second", &mut buf);
+            assert_eq!(buf, tokenize("# second").tokens);
+        }
+    }
+
+    #[test]
+    fn tokenize_is_linear_in_document_size() {
+        // Guards against a regression to the old quadratic line scan: doubling
+        // the line count must not multiply the work by ~4x.
+        fn build(lines: usize) -> String {
+            let mut s = String::with_capacity(lines * 40);
+for _ in 0..lines {
+                s.push_str("- item **bold** with a [link](https://x.dev)\n");
+            }
+            s
+        }
+        // Warm up allocator/branch predictors.
+        let _ = tokenize(&build(200));
+
+        let small = build(2_000);
+        let large = build(8_000); // 4x the bytes
+
+        let t0 = std::time::Instant::now();
+        let _ = tokenize(&small);
+        let small_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t0 = std::time::Instant::now();
+        let _ = tokenize(&large);
+        let large_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // 4x input should cost ~4x time, not ~16x. Use a generous ceiling so
+        // the assertion is stable on loaded CI machines while still catching a
+        // genuine return to O(n²).
+        let budget = (small_ms * 12.0).max(25.0);
+        assert!(
+            large_ms <= budget,
+            "tokenize looks super-linear: 4x input took {large_ms:.1}ms vs {small_ms:.1}ms for 1x"
+        );
     }
 }
