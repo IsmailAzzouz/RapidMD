@@ -31,3 +31,6 @@ axis-v2.sqlite3-wal
 # Foundry IDE runtime & working sessions
 .foundry/
 WorkingSessions/
+
+# Generated Linux release archives
+/installer/dist/*.tar.gz

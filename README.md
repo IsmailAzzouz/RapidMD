@@ -6,9 +6,9 @@
   <p>Minimalist monochrome interface and workspace aesthetics.</p>
 
   [![Rust](https://img.shields.io/badge/Rust-2021%20Edition-black?logo=rust)](https://www.rust-lang.org/)
-  [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-black)](https://github.com/ismail/RustDownViewer)
+  [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-black)](https://github.com/IsmailAzzouz/RapidMD)
   [![License: MIT](https://img.shields.io/badge/License-MIT-black.svg)](https://github.com/IsmailAzzouz/RapidMD/blob/main/Cargo.toml)
-  [![GUI](https://img.shields.io/badge/GUI-egui%200.31-black)](https://github.com/emilk/egui)
+  [![GUI](https://img.shields.io/badge/GUI-egui%200.36-black)](https://github.com/emilk/egui)
 </div>
 
 ---
@@ -34,19 +34,27 @@
 
 ## Downloads & Installation
 
-### Windows Installer (`.exe`)
+The latest release is **v0.3.0**: [GitHub Releases](https://github.com/IsmailAzzouz/RapidMD/releases/latest).
 
-Download the ready-to-run setup wizard:
+### Windows
 
-👉 **[Download RapidMD-Setup-v0.2.0.exe (Latest Release)](https://github.com/IsmailAzzouz/RapidMD/releases/download/v0.2.0/RapidMD-Setup-v0.2.0.exe)** *(~6.2 MB)*
+[Download RapidMD-Setup-v0.3.0.exe](https://github.com/IsmailAzzouz/RapidMD/releases/download/v0.3.0/RapidMD-Setup-v0.3.0.exe) (~7.6 MB). The setup wizard installs RapidMD, creates Desktop and Start Menu shortcuts, registers `.md` and `.markdown` files, and adds an **Open with RapidMD** context menu entry. It also provides an uninstaller through Windows Settings.
 
-#### What the Installer Does:
-- Installs RapidMD into `Program Files` (or `%LocalAppData%\Programs\RapidMD`).
-- Creates **Desktop** and **Start Menu** shortcuts with embedded high-resolution icons.
-- Registers Windows file associations (`OpenWithProgids` & `Default Programs`) for **`.md`** and **`.markdown`** files with application icons.
-- Integrates **"Open with RapidMD"** into the Windows right-click context menu.
-- Suppresses command-line console windows for a seamless, secure desktop experience.
-- Includes a clean Windows uninstaller accessible via Windows Settings / Add or Remove Programs.
+### Linux (x86_64)
+
+Download [RapidMD-v0.3.0-linux-x86_64.tar.gz](https://github.com/IsmailAzzouz/RapidMD/releases/download/v0.3.0/RapidMD-v0.3.0-linux-x86_64.tar.gz), extract it, then run the included per-user installer:
+
+```bash
+tar -xzf RapidMD-v0.3.0-linux-x86_64.tar.gz
+cd rapidmd-linux-x86_64-staging
+./install-linux.sh
+```
+
+The installer puts the app in `~/.local/bin`, registers an application launcher and Desktop shortcut, and adds Markdown MIME types for the file manager's **Open With** menu. It does not need `sudo`. To make RapidMD the default Markdown app, run `xdg-mime default rapidmd.desktop text/markdown`. To uninstall, run `~/.local/share/rapidmd/install-linux.sh --uninstall` (or run `./install-linux.sh --uninstall` from the extracted directory). Ubuntu may require the system GTK/Wayland/X11 libraries used by eframe; install missing runtime libraries through the distribution package manager.
+
+### Other platforms
+
+The source is cross-platform, but prebuilt downloads are currently provided for Windows and Linux x86_64.
 
 ---
 
@@ -54,33 +62,46 @@ Download the ready-to-run setup wizard:
 
 ### Prerequisites
 
-- [Rust toolchain](https://rustup.rs/) (1.80+ recommended, edition 2021).
-- (Optional, for building the Windows installer) [Inno Setup 6+](https://jrsoftware.org/isinfo.php).
+- [Rust toolchain](https://rustup.rs/) (edition 2021).
+- Linux builds need the platform development libraries required by eframe, winit, and GTK file dialogs.
+- Windows installer builds need [Inno Setup 6+](https://jrsoftware.org/isinfo.php).
 
 ### Compile and Run
 
 ```bash
-# Clone the repository
 git clone https://github.com/IsmailAzzouz/RapidMD.git
-cd RustDownViewer
-
-# Run in development mode
+cd RapidMD
 cargo run
-
-# Build optimized release binary
-cargo build --release
 ```
 
-The compiled standalone executable is generated at `target/release/rapidmd.exe`.
-
-### Building the Windows Installer
+Build the optimized standalone executable with the shipping profile:
 
 ```bash
-# Compile using Inno Setup
-iscc installer/rapidmd.iss
+cargo build --locked --profile fast --bin rapidmd
 ```
 
-The installer executable will be output to `installer/dist/RapidMD-Setup-v0.2.0.exe`.
+The executable is generated at `target/fast/rapidmd` on Linux or `target/fast/rapidmd.exe` on Windows.
+
+### Build the Windows Installer
+
+On Windows, run:
+
+```bat
+installer\build_installer.bat
+```
+
+The script builds the optimized executable and compiles `installer/rapidmd.iss`. The setup executable is written to `installer/dist/`.
+
+### Build the Linux Installer Package
+
+On Linux, run:
+
+```bash
+chmod +x installer/build_installer.sh
+installer/build_installer.sh
+```
+
+This builds the optimized Linux binary and creates `installer/dist/RapidMD-v<VERSION>-linux-<ARCH>.tar.gz`. Add `--install` to build and install the package for the current user. Supported package architectures are x86_64 and aarch64.
 
 ---
 
@@ -112,12 +133,12 @@ The installer executable will be output to `installer/dist/RapidMD-Setup-v0.2.0.
 
 ## Tech Stack & Architecture
 
-- **GUI & Rendering**: [eframe](https://github.com/emilk/egui/tree/master/crates/eframe) & [egui](https://github.com/emilk/egui) 0.31 with GPU acceleration.
-- **Markdown Parsing**: [pulldown-cmark](https://github.com/raphlinus/pulldown-cmark) 0.12 (CommonMark compliant pull-parser).
+- **GUI & Rendering**: [eframe](https://github.com/emilk/egui/tree/master/crates/eframe) & [egui](https://github.com/emilk/egui) 0.36 with GPU acceleration.
+- **Markdown Parsing**: [pulldown-cmark](https://github.com/raphlinus/pulldown-cmark) 0.13 (CommonMark compliant pull-parser).
 - **Syntax Highlighting**: [syntect](https://github.com/trishume/syntect) 5.3 using TextMate grammars.
 - **Typography**: [Inter](https://rsms.me/inter/) and [JetBrains Mono](https://www.jetbrains.com/lp/mono/) embedded via TrueType data.
 - **Image Decoding**: [image](https://github.com/image-rs/image) 0.25 (PNG, JPEG, WebP, GIF, BMP).
-- **Clipboard & Dialogs**: [arboard](https://github.com/1Password/arboard) 3.0 and [rfd](https://github.com/PolyMeilex/rfd) 0.15.
+- **Clipboard & Dialogs**: [arboard](https://github.com/1Password/arboard) 3.0 and [rfd](https://github.com/PolyMeilex/rfd) 0.17.
 
 ---
 
