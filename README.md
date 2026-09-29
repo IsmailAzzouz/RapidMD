@@ -21,7 +21,6 @@
 
 ## Key Highlights
 
-- **Tesla & Notion-Inspired Monochrome Design**: Built entirely on deep obsidian blacks (`#0C0D0F`), neutral graphites, crisp whites, and subtle hairline borders. No distracting rainbow themes.
 - **Ultra-Lean Resource Footprint**: Optimized to use only **~40 MB of RAM** at idle. Employs on-demand memory mapping (`memmap2`) for glyph fallbacks and zero-cost text scanning, delivering instantaneous launch times.
 - **Embedded Modern Typography**: Bundles **Inter** (Regular, SemiBold, Bold) for prose and **JetBrains Mono** for code and line metrics, paired with active tessellation antialiasing feathering and whole-pixel snapping.
 - **Synchronized Split View**: Side-by-side editing and preview with bidirectional proportional scroll synchronization—scrolling either pane keeps the other aligned in real time.
